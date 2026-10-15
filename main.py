@@ -228,12 +228,15 @@ async def account_info():
     try:
         account = await ctrader_client.get_account_info()
         positions = await ctrader_client.get_open_positions()
+        unrealized_pnl = await ctrader_client.get_unrealized_pnl()
+        total_unrealized_pnl = sum(unrealized_pnl.values())
         return {
             "status": "success",
             "data": {
                 "balance": float(account.balance),
-                "equity": float(account.equity),
-                "currency": account.currency,
+                "equity": float(account.balance) + total_unrealized_pnl,
+                "unrealized_pnl": total_unrealized_pnl,
+                "deposit_asset_id": account.deposit_asset_id,
                 "open_position_count": len(positions),
             },
         }
@@ -256,9 +259,7 @@ async def get_positions():
                     "symbol_id": position.symbol_id,
                     "symbol": symbol,
                     "side": position.side.value.lower(),
-                    "volume": float(
-                        symbol_info.volume_to_lots(position.volume)
-                    ),
+                    "volume": float(symbol_info.volume_to_lots(position.volume)),
                     "entry_price": float(position.entry_price),
                     "stop_loss": float(position.stop_loss)
                     if position.stop_loss is not None
@@ -374,7 +375,7 @@ async def start_autotrading():
         return {"status": "already_running"}
     task = asyncio.create_task(trading_cycle.start(), name="autotrading-cycle")
     app.state.trading_task = task
-    return {"status": "started"}
+    return {"status": "auto trading started"}
 
 
 @app.post("/api/v1/auto/stop")
@@ -386,7 +387,7 @@ async def stop_autotrading():
             await asyncio.wait_for(task, timeout=5.0)
         except (TimeoutError, asyncio.CancelledError, Exception):
             pass
-    return {"status": "stopped"}
+    return {"status": "auto trading stopped"}
 
 
 @app.get("/api/v1/stats/r-multiple")

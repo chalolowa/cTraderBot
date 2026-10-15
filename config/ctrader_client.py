@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -83,6 +84,17 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.replace("_", "").upper()
 
 
+@dataclass(frozen=True, slots=True)
+class _SpotQuote:
+    account_id: int
+    symbol_id: int
+    bid: Decimal | None
+    ask: Decimal | None
+    timestamp: datetime
+    bid_timestamp: datetime | None
+    ask_timestamp: datetime | None
+
+
 class OrderResult:
     """Expose cTrader execution identifiers and fill details."""
 
@@ -112,7 +124,7 @@ class CTraderBrokerClient:
         self._symbol_name_to_id: dict[str, int] = {}
         self._symbol_id_to_name: dict[int, str] = {}
         self._symbol_cache: dict[int, Any] = {}
-        self._last_spot: dict[int, SpotEvent] = {}
+        self._last_spot: dict[int, _SpotQuote] = {}
         self._token_store = SQLiteTokenStore(settings.DB_PATH)
 
     # ---- lifecycle ------------------------------------------------------
@@ -171,7 +183,7 @@ class CTraderBrokerClient:
 
         @client.on(SpotEvent)
         async def _on_spot(event: SpotEvent) -> None:
-            self._last_spot[event.symbol_id] = event
+            self._cache_spot_event(event)
 
         @client.on(ReadyEvent)
         async def _on_ready(event: ReadyEvent) -> None:
@@ -209,11 +221,44 @@ class CTraderBrokerClient:
                 f"{event.account_id}: {event.error}. No prices for affected symbols until the next reconnect."
             )
 
+    def _cache_spot_event(self, event: SpotEvent) -> None:
+        previous = self._last_spot.get(event.symbol_id)
+        bid_is_newer = event.bid is not None and (
+            previous is None
+            or previous.bid_timestamp is None
+            or event.timestamp >= previous.bid_timestamp
+        )
+        ask_is_newer = event.ask is not None and (
+            previous is None
+            or previous.ask_timestamp is None
+            or event.timestamp >= previous.ask_timestamp
+        )
+        bid = previous.bid if previous else None
+        ask = previous.ask if previous else None
+        bid_timestamp = previous.bid_timestamp if previous else None
+        ask_timestamp = previous.ask_timestamp if previous else None
+        if bid_is_newer:
+            bid = event.bid
+            bid_timestamp = event.timestamp
+        if ask_is_newer:
+            ask = event.ask
+            ask_timestamp = event.timestamp
+        self._last_spot[event.symbol_id] = _SpotQuote(
+            account_id=event.account_id,
+            symbol_id=event.symbol_id,
+            bid=bid,
+            ask=ask,
+            timestamp=event.timestamp,
+            bid_timestamp=bid_timestamp,
+            ask_timestamp=ask_timestamp,
+        )
+
     async def disconnect(self) -> None:
         if self._client is None:
             return
         await self._client.__aexit__(None, None, None)
         self._client = None
+        self._last_spot.clear()
         _console("cTrader: disconnected")
 
     @property
@@ -260,21 +305,29 @@ class CTraderBrokerClient:
         await self._client.market_data.subscribe_spots(self._account_id, ids)
         _console(f"cTrader: subscribed to live prices for {len(ids)} symbol(s)")
 
-    def get_tick(self, symbol: str) -> SpotEvent:
-        """Most recent cached spot price. VERIFY: this is push-based, unlike
-        MT5's synchronous symbol_info_tick -- call ensure_subscribed() for a
-        symbol before relying on this, and treat a stale (>5s) price as a
-        signal to wait for the next update, not as a hard failure."""
+    def get_tick(self, symbol: str) -> _SpotQuote:
+        """Return the latest complete quote assembled from spot updates."""
         symbol_id = self._symbol_name_to_id.get(normalize_symbol(symbol))
         if symbol_id is None or symbol_id not in self._last_spot:
             raise RuntimeError(
                 f"cTrader: no cached price for {symbol} -- is it subscribed?"
             )
-        event = self._last_spot[symbol_id]
-        age = (datetime.now(UTC) - event.timestamp).total_seconds()
+        quote = self._last_spot[symbol_id]
+        if quote.bid is None or quote.ask is None:
+            missing = "bid" if quote.bid is None else "ask"
+            raise RuntimeError(
+                f"cTrader: waiting for a complete {symbol} quote; {missing} is not available yet"
+            )
+        now = datetime.now(UTC)
+        side_timestamps = (quote.bid_timestamp, quote.ask_timestamp)
+        age = max(
+            (now - timestamp).total_seconds()
+            for timestamp in side_timestamps
+            if timestamp is not None
+        )
         if age > 5:
             _console(f"cTrader: WARNING stale price for {symbol} ({age:.1f}s old)")
-        return event
+        return quote
 
     async def copy_rates_from_pos(
         self, symbol: str, timeframe: str, start_pos: int = 0, count: int = 200
@@ -330,7 +383,9 @@ class CTraderBrokerClient:
         positions = await self.get_open_positions()
         return [p for p in positions if p.label == BOT_LABEL]
 
-    async def get_closed_position_summary(self, position_id: int) -> tuple[float, float]:
+    async def get_closed_position_summary(
+        self, position_id: int
+    ) -> tuple[float, float]:
         """Return the volume-weighted close price and realized gross PnL."""
         deals = await self._client.trading.get_deals_by_position_id(
             self._account_id, position_id
@@ -341,10 +396,13 @@ class CTraderBrokerClient:
             raise RuntimeError(
                 f"cTrader: no closing deals available yet for position {position_id}"
             )
-        exit_price = sum(
-            float(deal.execution_price) * deal.close_detail.closed_volume
-            for deal in closing_deals
-        ) / closed_volume
+        exit_price = (
+            sum(
+                float(deal.execution_price) * deal.close_detail.closed_volume
+                for deal in closing_deals
+            )
+            / closed_volume
+        )
         realized_pnl = sum(
             float(
                 deal.close_detail.gross_profit
@@ -355,6 +413,12 @@ class CTraderBrokerClient:
             for deal in closing_deals
         )
         return exit_price, realized_pnl
+
+    async def get_deals(self, from_timestamp: datetime, to_timestamp: datetime):
+        """Return broker deals executed in the requested time range."""
+        return await self._client.trading.get_deals(
+            self._account_id, from_timestamp, to_timestamp
+        )
 
     async def get_unrealized_pnl(self) -> dict[int, float]:
         """Return broker-reported unrealized PnL keyed by position ID."""

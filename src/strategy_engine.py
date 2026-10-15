@@ -79,7 +79,13 @@ class StrategyEngine:
         """Hot-reload strategy without restarting bot."""
         self.config = self._load_config(self.config_path)
 
-    def evaluate_entry(self, df: pd.DataFrame, direction: str) -> tuple[bool, dict[str, Any]]:
+    def evaluate_entry(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        *,
+        analyzed_df: pd.DataFrame | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
         """
         Evaluate if entry conditions are met for given direction (long/short).
         Returns (should_enter, metadata).
@@ -88,7 +94,9 @@ class StrategyEngine:
             _console(f"Strategy evaluation for {direction}: insufficient data (len={len(df)})", level=logging.INFO)
             return False, {"reason": "insufficient_data"}
 
-        enriched_df = self.ta.analyze_instrument(df, self.config)
+        enriched_df = analyzed_df
+        if enriched_df is None:
+            enriched_df = self.ta.analyze_instrument(df, self.config)
         signal = self.ta.get_latest_signal(enriched_df)
 
         if not signal:
@@ -97,6 +105,12 @@ class StrategyEngine:
 
         rules = self.config["entry_rules"].get(direction, {})
         conditions = rules.get("conditions", [])
+        if not conditions:
+            _console(
+                f"Strategy evaluation for {direction}: no entry conditions configured",
+                level=logging.WARNING,
+            )
+            return False, {"reason": "no_conditions"}
         require_all = rules.get("require_all", True)
 
         condition_results = []
@@ -145,7 +159,7 @@ class StrategyEngine:
         Evaluate a single condition from strategy.json.
         Returns (passed, actual_value, expected_value).
         """
-        indicator = cond["indicator"]
+        indicator = str(cond["indicator"]).upper()
         period = cond.get("period", 14)
         comparison = cond["comparison"]
 

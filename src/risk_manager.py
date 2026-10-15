@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import numpy as np
@@ -447,12 +447,16 @@ class RiskManager:
     def get_daily_summary(self) -> dict[str, Any]:
         """Get today's realized PnL and trade counts."""
         est_tz = pytz.timezone("US/Eastern")
-        today = datetime.now(est_tz).strftime("%Y-%m-%d")
+        today = datetime.now(est_tz).date()
+        start = est_tz.localize(datetime.combine(today, time.min)).astimezone(UTC)
+        end = est_tz.localize(
+            datetime.combine(today + timedelta(days=1), time.min)
+        ).astimezone(UTC)
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT COALESCE(SUM(pnl), 0), COUNT(*) FROM trades "
-                "WHERE status = 'closed' AND date(exit_time) = ?",
-                (today,),
+                "SELECT COALESCE(SUM(pnl), 0), COUNT(*) FROM trades WHERE status = 'closed' "
+                "AND exit_time >= ? AND exit_time < ?",
+                (start.isoformat(), end.isoformat()),
             ).fetchone()
             open_count = conn.execute(
                 "SELECT COUNT(*) FROM trades WHERE status = 'open'"
@@ -463,6 +467,23 @@ class RiskManager:
                 "closed_trades": int(row[1]),
                 "open_trades": int(open_count),
             }
+
+    def daily_loss_limit_reached(self, balance: float, limit_pct: float) -> bool:
+        """Return whether realized daily losses exceed the configured limit."""
+        if balance <= 0:
+            return False
+
+        daily_pnl = float(self.get_daily_summary()["daily_pnl"])
+        max_loss_amount = balance * (limit_pct / 100.0)
+        reached = daily_pnl < -max_loss_amount
+        if reached:
+            _console(
+                f"Daily loss limit reached (Realized PnL=${daily_pnl:.2f} <= "
+                f"-${max_loss_amount:.2f}, limit={limit_pct}%). "
+                "Skipping all new entries for the rest of the session.",
+                level=logging.WARNING,
+            )
+        return reached
 
 
 risk_manager = RiskManager()

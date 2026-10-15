@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import sqlite3
 from datetime import UTC, datetime
 
@@ -26,7 +27,7 @@ class TradingCycle:
     async def start(self) -> None:
         self.running = True
         _console("cTraderbot loop started", level=logging.INFO)
-        await telegram.send_message_async("cTraderbot started.")
+        await telegram.send_message_async("auto trading initiated....")
         while self.running:
             try:
                 await self._tick()
@@ -57,8 +58,6 @@ class TradingCycle:
         max_daily_loss_pct = strategy_engine.config.get("risk_management", {}).get(
             "max_daily_loss_pct", 3.0
         )
-        daily_summary = risk_manager.get_daily_summary()
-        daily_pnl = float(daily_summary.get("daily_pnl", 0.0))
         try:
             account = await ctrader_client.get_account_info()
             balance = float(getattr(account, "balance", 0.0) or 0.0)
@@ -69,25 +68,20 @@ class TradingCycle:
             )
             return
 
-        if balance > 0:
-            max_loss_amount = balance * (max_daily_loss_pct / 100.0)
-            if daily_pnl < -max_loss_amount:
-                _console(
-                    f"Daily loss limit reached (Realized PnL=${daily_pnl:.2f} <= -${max_loss_amount:.2f}, limit={max_daily_loss_pct}%). "
-                    f"Skipping all new entries for the rest of the session.",
-                    level=logging.WARNING,
-                )
-                return
+        if risk_manager.daily_loss_limit_reached(balance, max_daily_loss_pct):
+            return
 
         # Scan cache evaluation across fresh process invocations (A4, B8)
-        cached_scan = scanner.get_cached_scan(max_age_seconds=1800)
+        scan_interval_seconds = settings.SCANNER_INTERVAL_MIN * 60
+        cached_scan = scanner.get_cached_scan(max_age_seconds=scan_interval_seconds)
         now_utc = datetime.now(UTC)
         last_scan = self.last_scan_time
         if last_scan is not None and last_scan.tzinfo is None:
             last_scan = last_scan.replace(tzinfo=UTC)
 
         if self.scan_results and (
-            last_scan is None or (now_utc - last_scan).total_seconds() < 1800
+            last_scan is None
+            or (now_utc - last_scan).total_seconds() < scan_interval_seconds
         ):
             ts_str = last_scan.isoformat() if last_scan else now_utc.isoformat()
             _console(
@@ -121,7 +115,7 @@ class TradingCycle:
         open_symbols = {
             ctrader_client.symbol_name(position.symbol_id) for position in positions
         }
-        for opportunity in self.scan_results[:3]:
+        for opportunity in self.scan_results:
             try:
                 current_positions = await ctrader_client.get_bot_positions()
                 if len(current_positions) >= max_open:
@@ -155,35 +149,63 @@ class TradingCycle:
             )
             return
 
-        latest = strategy_engine.ta.analyze_instrument(df, strategy_engine.config).iloc[
-            -1
-        ]
-        direction = (
-            "long" if latest.get("SMA_9", 0) > latest.get("SMA_21", 0) else "short"
-        )
-
-        # A10 logging: Symbol, guessed direction, timeframe, candle count fetched
         _console(
-            f"Evaluating {symbol}: guessed_direction={direction}, timeframe={timeframe}, candles={len(df)}",
+            f"Evaluating {symbol}: timeframe={timeframe}, candles={len(df)}",
             level=logging.INFO,
         )
-
-        should_enter, metadata = strategy_engine.evaluate_entry(df, direction)
+        analyzed_df = strategy_engine.ta.analyze_instrument(df, strategy_engine.config)
+        entry_matches = []
+        direction_results = {}
+        for direction in ("long", "short"):
+            should_enter, metadata = strategy_engine.evaluate_entry(
+                df, direction, analyzed_df=analyzed_df
+            )
+            direction_results[direction] = should_enter
+            if should_enter:
+                entry_matches.append((direction, metadata))
+        should_enter = len(entry_matches) == 1
+        direction = entry_matches[0][0] if should_enter else None
         risk_manager.record_event(
             "trade_decision",
             {
                 "instrument": symbol,
                 "direction": direction,
                 "should_enter": should_enter,
+                "direction_results": direction_results,
                 "timeframe": timeframe,
                 "candle_count": len(df),
                 "strategy": strategy_engine.config.get("name"),
             },
         )
         if not should_enter:
+            if len(entry_matches) > 1:
+                _console(
+                    f"Skipping {symbol}: both long and short strategy rules matched",
+                    level=logging.WARNING,
+                )
             return
 
+        direction, metadata = entry_matches[0]
         tick = ctrader_client.get_tick(symbol)
+        symbol_info = await ctrader_client.get_symbol_info(symbol)
+        pip_factor = 10**symbol_info.pip_position
+        spread_pips = (float(tick.ask) - float(tick.bid)) * pip_factor
+        max_spread = float(
+            strategy_engine.config.get("filters", {}).get(
+                "spread_max_pips", settings.MAX_SPREAD_PIPS
+            )
+        )
+        if (
+            not math.isfinite(spread_pips)
+            or spread_pips < 0
+            or spread_pips > max_spread
+        ):
+            _console(
+                f"Skipping {symbol} {direction}: live spread {spread_pips:.1f} pips "
+                f"exceeds limit {max_spread:.1f}",
+                level=logging.INFO,
+            )
+            return
         entry_price = float(tick.ask if direction == "long" else tick.bid)
         atr_val = metadata.get("atr")
         enriched_df = metadata.get("enriched_df", df)
@@ -278,7 +300,8 @@ class TradingCycle:
                 )
             except (CTraderError, RuntimeError, ValueError, sqlite3.Error) as exc:
                 _console(
-                    f"Close failed for position {position_id}: {exc}", level=logging.ERROR
+                    f"Close failed for position {position_id}: {exc}",
+                    level=logging.ERROR,
                 )
                 await telegram.send_message_async(
                     f"Close failed for position {position_id}: {exc}"
@@ -326,7 +349,7 @@ class TradingCycle:
     def stop(self) -> None:
         self.running = False
         _console("cTraderbot loop stopped", level=logging.INFO)
-        telegram.send_message("cTraderbot stopped.")
+        telegram.send_message("auto trading stopped.")
 
 
 trading_cycle = TradingCycle()

@@ -55,7 +55,10 @@ class TechnicalAnalyzer:
         avg_gain = gain.rolling(window=period, min_periods=period).mean()
         avg_loss = loss.rolling(window=period, min_periods=period).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
-        df[f"RSI_{period}"] = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+        rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+        df[f"RSI_{period}"] = rsi
         return df
 
     @staticmethod
@@ -172,24 +175,44 @@ class TechnicalAnalyzer:
 
         df = df.copy()
 
-        # Parse indicator periods from config if available
         sma_periods = {9, 21}
+        ema_periods: set[int] = set()
+        rsi_periods = {14}
+        adx_periods = {14}
+        atr_periods = {14}
         if strategy_config:
-            rules = strategy_config.get("rules", {})
-            for direction_rules in rules.values():
-                for cond in direction_rules:
-                    ind = cond.get("indicator", "")
-                    if ind == "sma" and "period" in cond:
-                        sma_periods.add(int(cond["period"]))
-                    if "reference" in cond and cond.get("reference") == "sma" and "ref_period" in cond:
-                        sma_periods.add(int(cond["ref_period"]))
+            entry_rules = strategy_config.get("entry_rules", {})
+            for direction_rules in entry_rules.values():
+                for cond in direction_rules.get("conditions", []):
+                    indicator = str(cond.get("indicator", "")).upper()
+                    period = int(cond.get("period", 14))
+                    if indicator == "SMA":
+                        sma_periods.add(period)
+                        if str(cond.get("reference", "")).upper() == "SMA":
+                            sma_periods.add(int(cond.get("ref_period", 21)))
+                    elif indicator == "EMA":
+                        ema_periods.add(period)
+                    elif indicator == "RSI":
+                        rsi_periods.add(period)
+                    elif indicator == "ADX":
+                        adx_periods.add(period)
+                    elif indicator == "ATR":
+                        atr_periods.add(period)
+
+            stop_loss = strategy_config.get("exit_rules", {}).get("stop_loss", {})
+            if stop_loss.get("type") == "ATR_MULTIPLE":
+                atr_periods.add(int(stop_loss.get("atr_period", 14)))
 
         for period in sorted(sma_periods):
             df = cls.add_sma(df, period)
-
-        df = cls.add_rsi(df, 14)
-        df = cls.add_atr(df, 14)
-        df = cls.add_adx(df, 14)
+        for period in sorted(ema_periods):
+            df = cls.add_ema(df, period)
+        for period in sorted(rsi_periods):
+            df = cls.add_rsi(df, period)
+        for period in sorted(atr_periods):
+            df = cls.add_atr(df, period)
+        for period in sorted(adx_periods):
+            df = cls.add_adx(df, period)
         df = cls.add_macd(df)
 
         # Detect standard SMA 9/21 crossovers
@@ -205,16 +228,26 @@ class TechnicalAnalyzer:
 
         latest = df.iloc[-1]
 
-        return {
-            "sma_9": latest.get("SMA_9"),
-            "sma_21": latest.get("SMA_21"),
-            "rsi_14": latest.get("RSI_14"),
-            "atr_14": latest.get("ATR_14"),
-            "adx_14": latest.get("ADX_14"),
-            "macd": latest.get("MACD_12_26_9"),
-            "macd_signal": latest.get("MACDs_12_26_9"),
-            "crossover_up": bool(latest.get("crossover_up", False)),
-            "crossover_down": bool(latest.get("crossover_down", False)),
-            "close": float(latest["close"]) if "close" in latest else 0.0,
-            "timestamp": latest.name.isoformat() if hasattr(latest.name, 'isoformat') else str(latest.name)
+        signal = {
+            column.lower(): latest[column]
+            for column in df.columns
+            if column.startswith(("SMA_", "EMA_", "RSI_", "ATR_", "ADX_"))
         }
+        signal.update(
+            {
+                "sma_9": latest.get("SMA_9"),
+                "sma_21": latest.get("SMA_21"),
+                "rsi_14": latest.get("RSI_14"),
+                "atr_14": latest.get("ATR_14"),
+                "adx_14": latest.get("ADX_14"),
+                "macd": latest.get("MACD_12_26_9"),
+                "macd_signal": latest.get("MACDs_12_26_9"),
+                "crossover_up": bool(latest.get("crossover_up", False)),
+                "crossover_down": bool(latest.get("crossover_down", False)),
+                "close": float(latest["close"]) if "close" in latest else 0.0,
+                "timestamp": latest.name.isoformat()
+                if hasattr(latest.name, "isoformat")
+                else str(latest.name),
+            }
+        )
+        return signal

@@ -1,30 +1,58 @@
 {
-  "name": "DayTrader_SMA_RSI",
-  "description": "Day trading strategy with SMA crossover and RSI confirmation. All positions closed before market close.",
+  "name": "DayTrader_SMA_RSI_V2",
+  "description": "More active M15 forex strategy using SMA crossover, RSI direction confirmation, and a lower ADX threshold. Risk controls retained; validate in demo before live use.",
   "timeframe": "M15",
   "candle_count": 200,
-
   "entry_rules": {
     "long": {
       "conditions": [
-        {"indicator": "SMA", "period": 9, "comparison": "crosses_above", "reference": "SMA", "ref_period": 21},
-        {"indicator": "RSI", "period": 14, "comparison": ">", "value": 50},
-        {"indicator": "RSI", "period": 14, "comparison": "<", "value": 70},
-        {"indicator": "ADX", "period": 14, "comparison": ">", "value": 20}
+        {
+          "indicator": "SMA",
+          "period": 9,
+          "comparison": "crosses_above",
+          "reference": "SMA",
+          "ref_period": 21
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": ">",
+          "value": 50
+        },
+        {
+          "indicator": "ADX",
+          "period": 14,
+          "comparison": ">",
+          "value": 15
+        }
       ],
       "require_all": true
     },
     "short": {
       "conditions": [
-        {"indicator": "SMA", "period": 9, "comparison": "crosses_below", "reference": "SMA", "ref_period": 21},
-        {"indicator": "RSI", "period": 14, "comparison": "<", "value": 50},
-        {"indicator": "RSI", "period": 14, "comparison": ">", "value": 30},
-        {"indicator": "ADX", "period": 14, "comparison": ">", "value": 20}
+        {
+          "indicator": "SMA",
+          "period": 9,
+          "comparison": "crosses_below",
+          "reference": "SMA",
+          "ref_period": 21
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": "<",
+          "value": 50
+        },
+        {
+          "indicator": "ADX",
+          "period": 14,
+          "comparison": ">",
+          "value": 15
+        }
       ],
       "require_all": true
     }
   },
-
   "exit_rules": {
     "stop_loss": {
       "type": "ATR_MULTIPLE",
@@ -45,23 +73,26 @@
       "trail_atr_multiplier": 1.0
     }
   },
-
   "risk_management": {
     "risk_per_trade_pct": 1.0,
     "max_daily_loss_pct": 3.0,
     "max_open_trades": 3,
     "min_risk_reward": 1.5
   },
-
   "filters": {
     "spread_max_pips": 3.0,
     "avoid_news_events": false,
     "trend_alignment_timeframe": "H1"
   },
-
   "instruments": [
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
-    "USDCAD", "EURGBP", "EURJPY", "GBPJPY",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCAD",
+    "EURGBP",
+    "EURJPY",
+    "GBPJPY",
     "AUDJPY"
   ]
 }

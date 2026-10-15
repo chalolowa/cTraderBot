@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     OUTBOX_SYNC_INTERVAL_SECONDS: float = 5.0
     OUTBOX_BATCH_SIZE: int = 100
     API_HOST: str = "127.0.0.1"
-    API_PORT: int = 8001
+    API_PORT: int = 8000
 
 
 settings = Settings()

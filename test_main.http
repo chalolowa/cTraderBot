@@ -1,21 +1,21 @@
 # Test your FastAPI endpoints
 
-GET http://127.0.0.1:8001/
+GET http://127.0.0.1:8000/
 Accept: application/json
 
 ###
 
-GET http://127.0.0.1:8001/dashboard/
+GET http://127.0.0.1:8000/dashboard/
 Accept: application/json
 
 ###
 
-GET http://127.0.0.1:8001/docs
+GET http://127.0.0.1:8000/docs
 Accept: application/json
 
 ###
 
-GET http://127.0.0.1:8001/dashboard/api/stats
+GET http://127.0.0.1:8000/dashboard/api/stats
 Accept: application/json
 
 ###
