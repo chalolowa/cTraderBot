@@ -5,7 +5,7 @@ against live market data. Fully dynamic — edit JSON to change strategy.
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 import pandas as pd
 
@@ -277,6 +277,102 @@ class StrategyEngine:
                 return entry_price - reward
 
         return entry_price * 1.02 if direction == "long" else entry_price * 0.98
+
+    # ------------------------------------------------------------------
+    # Higher-timeframe trend filter, management and guard settings
+    # ------------------------------------------------------------------
+    _TREND_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "enabled": True,
+        "timeframe": "H1",
+        "candle_count": 150,
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "slope_bars": 5,
+        "adx_period": 14,
+        "min_adx": 20,
+        "drift_lookback_bars": 12,
+        "max_counter_drift_atr": 1.0,
+    }
+    _MANAGEMENT_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "enabled": True,
+        "breakeven_r": 1.0,
+        "breakeven_buffer_r": 0.1,
+        "min_stop_step_r": 0.1,
+        "min_stop_distance_pips": 1.0,
+        "exit_on_opposite_cross_in_profit": True,
+        "min_profit_r_for_signal_exit": 0.2,
+        "exit_on_htf_flip": True,
+        "late_day_lock_minutes": 120,
+        "late_day_lock_min_r": 0.3,
+        "late_day_lock_fraction": 0.5,
+        "late_day_close_minutes": 45,
+        "late_day_close_min_r": 0.5,
+    }
+    _GUARD_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "max_signal_age_minutes": 4,
+        "max_chase_atr": 0.5,
+        "cooldown_minutes_after_loss": 90,
+        "max_trades_per_symbol_per_day": 2,
+        "max_consecutive_losses": 3,
+        "max_currency_net_exposure": 1,
+        "no_new_entries_minutes_before_flatten": 120,
+    }
+
+    def get_trend_filter_config(self) -> dict[str, Any]:
+        cfg = dict(self._TREND_DEFAULTS)
+        cfg.update(self.config.get("filters", {}).get("trend_filter", {}))
+        return cfg
+
+    def get_management_config(self) -> dict[str, Any]:
+        cfg = dict(self._MANAGEMENT_DEFAULTS)
+        cfg.update(self.config.get("trade_management", {}))
+        # Keep the legacy trailing_stop block meaningful: it now drives the trail.
+        trail = self.config.get("exit_rules", {}).get("trailing_stop", {})
+        cfg["trail_enabled"] = bool(trail.get("enabled", True))
+        cfg["trail_start_r"] = float(trail.get("activation_r_multiple", 1.5))
+        cfg["trail_atr_mult"] = float(trail.get("trail_atr_multiplier", 1.5))
+        return cfg
+
+    def get_guard_config(self) -> dict[str, Any]:
+        cfg = dict(self._GUARD_DEFAULTS)
+        cfg.update(self.config.get("entry_guards", {}))
+        return cfg
+
+    def compute_htf_bias(self, htf_df: pd.DataFrame) -> dict[str, Any]:
+        """Bias of the higher timeframe ("long" / "short" / "neutral")."""
+        cfg = self.get_trend_filter_config()
+        return self.ta.compute_trend_bias(
+            htf_df,
+            ema_fast=int(cfg["ema_fast"]),
+            ema_slow=int(cfg["ema_slow"]),
+            slope_bars=int(cfg["slope_bars"]),
+            adx_period=int(cfg["adx_period"]),
+            min_adx=float(cfg["min_adx"]),
+            drift_lookback_bars=int(cfg["drift_lookback_bars"]),
+        )
+
+    def direction_allowed_by_trend(
+        self, direction: str, bias: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """
+        Gate an M15 entry with the higher-timeframe bias.
+        Fail-closed: no usable bias -> no trade.
+        """
+        cfg = self.get_trend_filter_config()
+        if not cfg.get("enabled", True):
+            return True, "trend_filter_disabled"
+
+        htf_bias = bias.get("bias", "neutral")
+        if htf_bias != direction:
+            return False, f"htf_bias={htf_bias} ({bias.get('reason', '')}) vs {direction}"
+
+        drift = float(bias.get("drift_atr", 0.0))
+        limit = float(cfg["max_counter_drift_atr"])
+        if direction == "long" and drift < -limit:
+            return False, f"day drift {drift:+.2f} ATR is against a long"
+        if direction == "short" and drift > limit:
+            return False, f"day drift {drift:+.2f} ATR is against a short"
+        return True, "aligned"
 
     def get_instruments(self) -> list[str]:
         return [item.replace("_", "").upper() for item in self.config.get("instruments", [])]

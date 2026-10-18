@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
@@ -13,7 +15,7 @@ from dashboard.multiple_tracker import (
     api_trade_history,
     dashboard_home,
 )
-from src.risk_manager import RiskManager
+from src.risk_manager import RiskManager, Trade
 from src.scanner import MarketScanner
 from src.strategy_engine import StrategyEngine
 from src.technical_analysis import TechnicalAnalyzer
@@ -119,6 +121,25 @@ class TechnicalAnalysisTests(TestCase):
         self.assertEqual(flat_rsi, 50.0)
         self.assertEqual(rising_rsi, 100.0)
 
+    def test_trend_bias_requires_sufficient_data_and_detects_uptrend(self) -> None:
+        close = pd.Series([1 + index * 0.001 for index in range(100)])
+        candles = pd.DataFrame(
+            {
+                "close": close,
+                "high": close + 0.002,
+                "low": close - 0.002,
+            }
+        )
+
+        with patch("src.technical_analysis.ta", None):
+            insufficient = TechnicalAnalyzer.compute_trend_bias(candles.iloc[:20])
+            bias = TechnicalAnalyzer.compute_trend_bias(candles)
+
+        self.assertEqual(insufficient["bias"], "neutral")
+        self.assertEqual(insufficient["reason"], "insufficient_htf_data")
+        self.assertEqual(bias["bias"], "long")
+        self.assertGreater(bias["drift_atr"], 0)
+
     def test_analyzer_builds_indicator_periods_from_entry_rules(self) -> None:
         close = pd.Series([1 + index * 0.001 for index in range(40)])
         candles = pd.DataFrame(
@@ -210,6 +231,29 @@ class RiskManagerTests(TestCase):
         self.assertTrue(manager.daily_loss_limit_reached(1000.0, 3.0))
         manager.get_daily_summary = lambda: {"daily_pnl": -29.0}
         self.assertFalse(manager.daily_loss_limit_reached(1000.0, 3.0))
+
+    def test_symbol_cooldown_sees_loss_closed_today_from_older_entry(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            manager = RiskManager(str(Path(temp_dir) / "trades.db"))
+            start, _ = manager._today_window_utc()
+            manager.record_entry(
+                Trade(
+                    trade_id=1,
+                    instrument="EURUSD",
+                    direction="long",
+                    entry_price=1.1,
+                    stop_loss=1.09,
+                    take_profit=1.13,
+                    entry_time=start - timedelta(minutes=1),
+                )
+            )
+            manager.record_exit(1, exit_price=1.09, pnl=-10.0, exit_reason="stop_loss")
+
+            activity = manager.symbol_activity_today("EURUSD")
+
+        self.assertEqual(activity["count"], 0)
+        self.assertIsNotNone(activity["last_closed"])
+        self.assertEqual(activity["last_closed"]["pnl"], -10.0)
 
 
 class DashboardTests(IsolatedAsyncioTestCase):

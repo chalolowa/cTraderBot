@@ -103,6 +103,14 @@ class RiskManager:
                 )
             """)
 
+            # Trade-management columns (added after the first release). `stop_loss`
+            # stays the INITIAL stop so R-multiples remain comparable; `current_stop`
+            # is the trailed stop, `peak_r` the best open profit reached (MFE).
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+            for column in ("current_stop", "peak_r", "peak_price"):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {column} REAL")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS daily_summary (
                     date TEXT PRIMARY KEY,
@@ -343,15 +351,16 @@ class RiskManager:
         """Save end-of-day summary for historical tracking using US/Eastern date."""
         est_tz = pytz.timezone("US/Eastern")
         today = datetime.now(est_tz).strftime("%Y-%m-%d")
+        start, end = self._today_window_utc()
 
         with self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT r_multiple FROM trades
-                WHERE status = 'closed' AND date(exit_time) = ?
+                WHERE status = 'closed' AND exit_time >= ? AND exit_time < ?
                 ORDER BY exit_time
             """,
-                (today,),
+                (start.isoformat(), end.isoformat()),
             ).fetchall()
 
             if not rows:
@@ -468,18 +477,130 @@ class RiskManager:
                 "open_trades": int(open_count),
             }
 
-    def daily_loss_limit_reached(self, balance: float, limit_pct: float) -> bool:
-        """Return whether realized daily losses exceed the configured limit."""
+    # ------------------------------------------------------------------
+    # Day window / journal queries used by the entry guards
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _today_window_utc() -> tuple[datetime, datetime]:
+        est_tz = pytz.timezone("US/Eastern")
+        today = datetime.now(est_tz).date()
+        start = est_tz.localize(datetime.combine(today, time.min)).astimezone(UTC)
+        end = est_tz.localize(
+            datetime.combine(today + timedelta(days=1), time.min)
+        ).astimezone(UTC)
+        return start, end
+
+    @staticmethod
+    def _parse_ts(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+
+    def get_trade(self, trade_id: int) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM trades WHERE trade_id = ?", (str(trade_id),)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_trade_management(
+        self,
+        trade_id: int,
+        *,
+        current_stop: float | None = None,
+        peak_r: float | None = None,
+        peak_price: float | None = None,
+        take_profit: float | None = None,
+    ) -> None:
+        """Persist trailed stop / best profit reached for an open trade."""
+        fields, params = [], []
+        for name, value in (
+            ("current_stop", current_stop),
+            ("peak_r", peak_r),
+            ("peak_price", peak_price),
+            ("take_profit", take_profit),
+        ):
+            if value is not None:
+                fields.append(f"{name} = ?")
+                params.append(float(value))
+        if not fields:
+            return
+        params.append(str(trade_id))
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE trades SET {', '.join(fields)} WHERE trade_id = ?", params
+            )
+
+    def get_today_closed_trades(self) -> list[dict[str, Any]]:
+        start, end = self._today_window_utc()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status = 'closed' "
+                "AND exit_time >= ? AND exit_time < ? ORDER BY exit_time",
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def consecutive_losses_today(self) -> int:
+        """Length of the current losing streak among today's closed trades."""
+        streak = 0
+        for trade in reversed(self.get_today_closed_trades()):
+            pnl = float(trade.get("pnl") or 0.0)
+            if pnl < 0:
+                streak += 1
+            else:
+                break
+        return streak
+
+    def symbol_activity_today(self, symbol: str) -> dict[str, Any]:
+        """Trades taken today on a symbol, plus its most recent closed trade."""
+        start, end = self._today_window_utc()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE instrument = ? "
+                "AND entry_time >= ? AND entry_time < ? ORDER BY entry_time",
+                (symbol, start.isoformat(), end.isoformat()),
+            ).fetchall()
+            last_closed = conn.execute(
+                "SELECT * FROM trades WHERE instrument = ? AND status = 'closed' "
+                "AND exit_time >= ? AND exit_time < ? ORDER BY exit_time DESC LIMIT 1",
+                (symbol, start.isoformat(), end.isoformat()),
+            ).fetchone()
+        trades = [dict(row) for row in rows]
+        return {
+            "count": len(trades),
+            "last_closed": dict(last_closed) if last_closed else None,
+            "last_entry_time": self._parse_ts(trades[-1]["entry_time"]) if trades else None,
+        }
+
+    def daily_loss_limit_reached(
+        self, balance: float, limit_pct: float, floating_pnl: float = 0.0
+    ) -> bool:
+        """
+        Return whether today's losses exceed the configured limit.
+
+        The limit is a % of the START-of-day balance (current balance minus what
+        has already been realised today) and counts floating P&L when supplied,
+        so concurrent open losers are included before they are stopped out.
+        """
         if balance <= 0:
             return False
 
-        daily_pnl = float(self.get_daily_summary()["daily_pnl"])
-        max_loss_amount = balance * (limit_pct / 100.0)
-        reached = daily_pnl < -max_loss_amount
+        realized = float(self.get_daily_summary()["daily_pnl"])
+        start_balance = balance - realized
+        if start_balance <= 0:
+            start_balance = balance
+        total = realized + min(0.0, float(floating_pnl))
+        max_loss_amount = start_balance * (limit_pct / 100.0)
+        reached = total < -max_loss_amount
         if reached:
             _console(
-                f"Daily loss limit reached (Realized PnL=${daily_pnl:.2f} <= "
-                f"-${max_loss_amount:.2f}, limit={limit_pct}%). "
+                f"Daily loss limit reached (realized=${realized:.2f}, floating=${floating_pnl:.2f}, "
+                f"limit=-${max_loss_amount:.2f} = {limit_pct}% of ${start_balance:.2f}). "
                 "Skipping all new entries for the rest of the session.",
                 level=logging.WARNING,
             )

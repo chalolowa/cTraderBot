@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 from ctrader_api_client import (
     AccountCredentials,
+    AmendPositionRequest,
     ClientConfig,
     ClosePositionRequest,
     CTraderClient,
@@ -519,6 +520,16 @@ class CTraderBrokerClient:
             f"fill_price={execution.fill_price} type={execution.execution_type.value}"
         )
         return OrderResult(execution, ok)
+
+    async def amend_position_sltp(
+        self, position_id: int, stop_loss: float | None, take_profit: float | None
+    ) -> None:
+        request = AmendPositionRequest(
+            position_id=int(position_id),
+            stop_loss=Decimal(str(stop_loss)) if stop_loss is not None else None,
+            take_profit=Decimal(str(take_profit)) if take_profit is not None else None,
+        )
+        await self._client.trading.amend_position(self._account_id, request)
 
     async def close_position(self, position_id: int) -> OrderResult:
         positions = await self.get_open_positions()

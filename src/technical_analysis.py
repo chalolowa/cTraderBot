@@ -221,6 +221,77 @@ class TechnicalAnalyzer:
         return df
 
     @classmethod
+    def compute_trend_bias(
+            cls,
+            df: pd.DataFrame,
+            ema_fast: int = 20,
+            ema_slow: int = 50,
+            slope_bars: int = 5,
+            adx_period: int = 14,
+            min_adx: float = 20.0,
+            drift_lookback_bars: int = 12,
+    ) -> dict[str, Any]:
+        """
+        Higher-timeframe bias (meant for H1 candles).
+
+        bias is "long" / "short" / "neutral". A direction needs ALL of:
+          * fast EMA on the right side of slow EMA
+          * close on the right side of slow EMA
+          * slow EMA sloping the same way over `slope_bars`
+          * ADX >= min_adx (otherwise the market is ranging -> neutral)
+        drift_atr is the net move over `drift_lookback_bars` in ATR units; the caller
+        uses it to veto entries against the recent move.
+        """
+        need = max(ema_slow, adx_period * 2, drift_lookback_bars) + slope_bars + 2
+        if df is None or df.empty or len(df) < need:
+            return {"bias": "neutral", "reason": "insufficient_htf_data", "drift_atr": 0.0}
+
+        d = cls.add_ema(df, ema_fast)
+        d = cls.add_ema(d, ema_slow)
+        d = cls.add_adx(d, adx_period)
+        d = cls.add_atr(d, adx_period)
+
+        last = d.iloc[-1]
+        fast_v = last.get(f"EMA_{ema_fast}")
+        slow_v = last.get(f"EMA_{ema_slow}")
+        adx_v = last.get(f"ADX_{adx_period}")
+        atr_v = last.get(f"ATR_{adx_period}")
+        slow_prev = d[f"EMA_{ema_slow}"].iloc[-1 - slope_bars]
+        if any(v is None or pd.isna(v) for v in (fast_v, slow_v, adx_v, atr_v, slow_prev)):
+            return {"bias": "neutral", "reason": "htf_indicators_not_ready", "drift_atr": 0.0}
+
+        close = float(last["close"])
+        fast_v, slow_v, adx_v, atr_v = float(fast_v), float(slow_v), float(adx_v), float(atr_v)
+        slope = slow_v - float(slow_prev)
+
+        long_ok = fast_v > slow_v and close > slow_v and slope > 0
+        short_ok = fast_v < slow_v and close < slow_v and slope < 0
+        trending = adx_v >= min_adx
+
+        bias = "neutral"
+        reason = "ranging_or_mixed"
+        if trending and long_ok:
+            bias, reason = "long", "trend_up"
+        elif trending and short_ok:
+            bias, reason = "short", "trend_down"
+        elif not trending:
+            reason = f"htf_adx_{adx_v:.1f}_below_{min_adx:g}"
+
+        ref_close = float(d["close"].iloc[-1 - drift_lookback_bars])
+        drift_atr = (close - ref_close) / atr_v if atr_v > 0 else 0.0
+
+        return {
+            "bias": bias,
+            "reason": reason,
+            "adx": round(adx_v, 1),
+            "ema_fast": fast_v,
+            "ema_slow": slow_v,
+            "slope": slope,
+            "drift_atr": round(drift_atr, 2),
+            "bar_time": str(d.index[-1]),
+        }
+
+    @classmethod
     def get_latest_signal(cls, df: pd.DataFrame) -> dict[str, Any]:
         """Extract latest indicator values and signal states."""
         if df.empty:
