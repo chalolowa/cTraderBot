@@ -565,15 +565,12 @@ class RiskManager:
                 "AND entry_time >= ? AND entry_time < ? ORDER BY entry_time",
                 (symbol, start.isoformat(), end.isoformat()),
             ).fetchall()
-            last_closed = conn.execute(
-                "SELECT * FROM trades WHERE instrument = ? AND status = 'closed' "
-                "AND exit_time >= ? AND exit_time < ? ORDER BY exit_time DESC LIMIT 1",
-                (symbol, start.isoformat(), end.isoformat()),
-            ).fetchone()
         trades = [dict(row) for row in rows]
+        closed = [t for t in trades if t.get("status") == "closed"]
+        closed.sort(key=lambda t: t.get("exit_time") or "")
         return {
             "count": len(trades),
-            "last_closed": dict(last_closed) if last_closed else None,
+            "last_closed": closed[-1] if closed else None,
             "last_entry_time": self._parse_ts(trades[-1]["entry_time"]) if trades else None,
         }
 

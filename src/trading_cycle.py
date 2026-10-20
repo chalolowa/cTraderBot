@@ -13,6 +13,7 @@ from ctrader_api_client.exceptions import CTraderError
 
 from config.ctrader_client import ctrader_client, normalize_symbol
 from config.settings import settings
+from src.candles import fetch_closed_candles, timeframe_minutes
 from src.logger import _console
 from src.market_hours import market_hours
 from src.risk_manager import Trade, risk_manager
@@ -173,9 +174,7 @@ class TradingCycle:
         timeframe = strategy_engine.config.get("timeframe", "M15")
         candle_count = strategy_engine.config.get("candle_count", 200)
 
-        df = await ctrader_client.copy_rates_from_pos(
-            symbol, timeframe, 1, candle_count
-        )
+        df = await fetch_closed_candles(symbol, timeframe, int(candle_count))
         if df.empty or len(df) < 5:
             _console(
                 f"Insufficient candle data for {symbol} (count={len(df)})",
@@ -202,9 +201,32 @@ class TradingCycle:
             should_enter, metadata = strategy_engine.evaluate_entry(
                 df, direction, analyzed_df=analyzed_df
             )
+            metadata["mode"] = "crossover"
+            if not should_enter:
+                # No fresh crossover: look for a continuation entry in a running trend.
+                pb_ok, pb_meta = strategy_engine.evaluate_pullback(
+                    analyzed_df, direction
+                )
+                if pb_ok:
+                    should_enter, metadata = True, pb_meta
             direction_results[direction] = should_enter
             if should_enter:
                 entry_matches.append((direction, metadata))
+
+        # One readable line per evaluation (what the bot saw and why it did or did not act).
+        htf_line = "htf=n/a"
+        if strategy_engine.get_trend_filter_config().get("enabled", True):
+            bias_now = await self._get_htf_bias(symbol)
+            htf_line = (
+                f"htf={bias_now.get('bias')} (adx={bias_now.get('adx', '-')}, "
+                f"drift={bias_now.get('drift_atr', 0)} ATR, {bias_now.get('reason', '')})"
+            )
+        _console(
+            f"DECISION {symbol} bar={bar_key[:16]}: long={'ENTRY' if direction_results['long'] else 'no'} "
+            f"short={'ENTRY' if direction_results['short'] else 'no'} | {htf_line} | "
+            f"modes={[m[1].get('mode') for m in entry_matches]}",
+            level=logging.INFO,
+        )
         should_enter = len(entry_matches) == 1
         direction = entry_matches[0][0] if should_enter else None
         risk_manager.record_event(
@@ -217,6 +239,7 @@ class TradingCycle:
                 "timeframe": timeframe,
                 "candle_count": len(df),
                 "bar": bar_key,
+                "mode": entry_matches[0][1].get("mode") if should_enter else None,
                 "strategy": strategy_engine.config.get("name"),
             },
         )
@@ -231,7 +254,12 @@ class TradingCycle:
         direction, metadata = entry_matches[0]
 
         blocked = await self._entry_blocked_reason(
-            symbol, direction, df.index[-1], timeframe
+            symbol,
+            direction,
+            df.index[-1],
+            timeframe,
+            mode=str(metadata.get("mode", "crossover")),
+            feed_lag_bars=int(df.attrs.get("lag_bars", 0)),
         )
         if blocked:
             _console(
@@ -375,15 +403,6 @@ class TradingCycle:
     # Entry guards
     # ------------------------------------------------------------------
     @staticmethod
-    def _tf_minutes(timeframe: str) -> int:
-        tf = str(timeframe).upper()
-        try:
-            n = int(tf[1:])
-        except ValueError:
-            return 15
-        return {"M": n, "H": n * 60, "D": n * 1440}.get(tf[:1], 15)
-
-    @staticmethod
     def _to_utc(ts: Any) -> datetime | None:
         if not hasattr(ts, "to_pydatetime") and not isinstance(ts, datetime):
             return None
@@ -401,11 +420,11 @@ class TradingCycle:
         if cached and (now - cached[0]).total_seconds() < max_age_s:
             return cached[1]
         try:
-            htf_df = await ctrader_client.copy_rates_from_pos(
-                symbol, cfg["timeframe"], 1, int(cfg["candle_count"])
+            htf_df = await fetch_closed_candles(
+                symbol, cfg["timeframe"], int(cfg["candle_count"])
             )
             bias = strategy_engine.compute_htf_bias(htf_df)
-        except (CTraderError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        except Exception as exc:  # fail closed: no bias -> no trade
             _console(f"HTF bias unavailable for {symbol}: {exc}", level=logging.WARNING)
             return {
                 "bias": "neutral",
@@ -434,7 +453,13 @@ class TradingCycle:
         return None
 
     async def _entry_blocked_reason(
-        self, symbol: str, direction: str, bar_index: Any, timeframe: str
+        self,
+        symbol: str,
+        direction: str,
+        bar_index: Any,
+        timeframe: str,
+        mode: str = "crossover",
+        feed_lag_bars: int = 0,
     ) -> str | None:
         """Return why this signal must not be traded, or None when it may be."""
         guards = strategy_engine.get_guard_config()
@@ -443,10 +468,15 @@ class TradingCycle:
 
         # 1. Freshness: a signal that is minutes old is a late entry.
         if bar_open is not None:
-            bar_close = bar_open + timedelta(minutes=self._tf_minutes(timeframe))
+            bar_close = bar_open + timedelta(minutes=timeframe_minutes(timeframe))
             age_min = (now - bar_close).total_seconds() / 60.0
             if age_min > float(guards["max_signal_age_minutes"]):
-                return f"stale signal ({age_min:.1f} min after candle close)"
+                hint = (
+                    f" — candle feed is {feed_lag_bars} bar(s) behind, check copy_rates_from_pos"
+                    if feed_lag_bars
+                    else ""
+                )
+                return f"stale signal ({age_min:.1f} min after candle close){hint}"
 
         # 2. Higher-timeframe trend must agree with the direction.
         if strategy_engine.get_trend_filter_config().get("enabled", True):
@@ -461,6 +491,12 @@ class TradingCycle:
         last_entry = activity["last_entry_time"]
         if bar_open is not None and last_entry is not None and last_entry >= bar_open:
             return "already traded this signal candle"
+        if mode == "pullback" and bar_open is not None and last_entry is not None:
+            gap = int(strategy_engine.get_pullback_config()["min_gap_bars"])
+            if (now - last_entry) < timedelta(
+                minutes=gap * timeframe_minutes(timeframe)
+            ):
+                return f"pullback re-entry gap ({gap} bars) on {symbol}"
         if activity["count"] >= int(guards["max_trades_per_symbol_per_day"]):
             return f"{activity['count']} trades on {symbol} today (cap reached)"
         last_closed = activity["last_closed"]
@@ -588,9 +624,7 @@ class TradingCycle:
         # 2. Fresh view of the market for this open trade.
         timeframe = strategy_engine.config.get("timeframe", "M15")
         candle_count = int(strategy_engine.config.get("candle_count", 200))
-        df = await ctrader_client.copy_rates_from_pos(
-            symbol, timeframe, 1, candle_count
-        )
+        df = await fetch_closed_candles(symbol, timeframe, candle_count)
         atr = None
         opposite_cross = False
         if not df.empty and len(df) >= 30:

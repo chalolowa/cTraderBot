@@ -13,6 +13,7 @@ import pandas as pd
 
 from config.ctrader_client import ctrader_client, normalize_symbol
 from config.settings import settings
+from src.candles import fetch_closed_candles
 from src.logger import _console
 from src.market_hours import market_hours
 from src.strategy_engine import strategy_engine
@@ -142,9 +143,7 @@ class MarketScanner:
         timeframe = strategy_engine.config.get("timeframe", "M15")
         candle_count = int(strategy_engine.config.get("candle_count", 200))
         try:
-            df = await ctrader_client.copy_rates_from_pos(
-                instrument, timeframe, 1, candle_count
-            )
+            df = await fetch_closed_candles(instrument, timeframe, candle_count)
         except Exception as exc:
             _console(
                 f"Failed to fetch rates for {instrument}: {exc}", level=logging.ERROR

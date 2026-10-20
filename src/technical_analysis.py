@@ -239,8 +239,8 @@ class TechnicalAnalyzer:
           * close on the right side of slow EMA
           * slow EMA sloping the same way over `slope_bars`
           * ADX >= min_adx (otherwise the market is ranging -> neutral)
-        drift_atr is the net move over `drift_lookback_bars` in ATR units; the caller
-        uses it to veto entries against the recent move.
+        drift_atr is the net move over `drift_lookback_bars` in ATR units, i.e. what the
+        "day so far" has done; the caller uses it to veto counter-drift entries.
         """
         need = max(ema_slow, adx_period * 2, drift_lookback_bars) + slope_bars + 2
         if df is None or df.empty or len(df) < need:
@@ -290,6 +290,64 @@ class TechnicalAnalyzer:
             "drift_atr": round(drift_atr, 2),
             "bar_time": str(d.index[-1]),
         }
+
+    @classmethod
+    def detect_pullback(
+            cls,
+            df: pd.DataFrame,
+            direction: str,
+            lookback_bars: int = 3,
+            tolerance_atr: float = 0.25,
+            min_adx: float = 20.0,
+            rsi_min: float = 45.0,
+            rsi_max: float = 85.0,
+            slope_bars: int = 3,
+            fast: int = 9,
+            slow: int = 21,
+            atr_period: int = 14,
+            adx_period: int = 14,
+            rsi_period: int = 14,
+    ) -> dict[str, Any]:
+        """
+        Trend-continuation entry: an established M15 trend dips to the fast SMA and the
+        latest closed candle resumes in the trend direction. Returns {"matched", "checks"}.
+        This is the entry a discretionary trader takes when a trend is already running
+        and no fresh crossover will ever appear.
+        """
+        cols = [f"SMA_{fast}", f"SMA_{slow}", f"ATR_{atr_period}", f"ADX_{adx_period}", f"RSI_{rsi_period}"]
+        need = lookback_bars + slope_bars + 2
+        if df is None or len(df) < need or any(c not in df.columns for c in cols):
+            return {"matched": False, "checks": [("data", False, "insufficient/missing indicators")]}
+
+        last = df.iloc[-1]
+        prior = df.iloc[-1 - lookback_bars:-1]
+        sma_f, sma_s = float(last[f"SMA_{fast}"]), float(last[f"SMA_{slow}"])
+        sma_s_prev = float(df[f"SMA_{slow}"].iloc[-1 - slope_bars])
+        atr, adx, rsi = float(last[f"ATR_{atr_period}"]), float(last[f"ADX_{adx_period}"]), float(last[f"RSI_{rsi_period}"])
+        if any(pd.isna(v) for v in (sma_f, sma_s, sma_s_prev, atr, adx, rsi)) or atr <= 0:
+            return {"matched": False, "checks": [("data", False, "indicators not ready")]}
+
+        tol = tolerance_atr * atr
+        is_long = direction == "long"
+        if is_long:
+            trend = sma_f > sma_s > sma_s_prev
+            touched = bool((prior["low"] <= prior[f"SMA_{fast}"] + tol).any())
+            resumed = bool(last["close"] > last["open"] and last["close"] > sma_f)
+            rsi_ok = rsi_min <= rsi <= rsi_max
+        else:
+            trend = sma_f < sma_s < sma_s_prev
+            touched = bool((prior["high"] >= prior[f"SMA_{fast}"] - tol).any())
+            resumed = bool(last["close"] < last["open"] and last["close"] < sma_f)
+            rsi_ok = (100 - rsi_max) <= rsi <= (100 - rsi_min)
+
+        checks = [
+            ("trend", trend, f"SMA{fast} {'>' if is_long else '<'} SMA{slow} and SMA{slow} sloping"),
+            ("adx", adx >= min_adx, f"ADX {adx:.1f} >= {min_adx:g}"),
+            ("pullback", touched, f"price touched SMA{fast} zone in last {lookback_bars} bars"),
+            ("resume", resumed, "latest candle closed back in trend direction beyond the fast SMA"),
+            ("rsi", rsi_ok, f"RSI {rsi:.1f} in range"),
+        ]
+        return {"matched": all(ok for _, ok, _ in checks), "checks": checks}
 
     @classmethod
     def get_latest_signal(cls, df: pd.DataFrame) -> dict[str, Any]:

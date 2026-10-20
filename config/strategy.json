@@ -1,24 +1,66 @@
 {
-  "name": "DayTrader_SMA_RSI_V3_TrendGated",
-  "description": "M15 SMA 9/21 crossover as the trigger, but only in the direction of the H1 trend, with trade management (breakeven, ATR trail, late-day profit lock), anti-whipsaw guards and correlation limits. Validate in demo before live use.",
+  "name": "DayTrader_SMA_RSI_V4_TrendGated",
+  "description": "M15 entries (SMA 9/21 crossover OR pullback-continuation) gated by the H1 trend; breakeven/ATR-trail/late-day profit management; anti-whipsaw guards. Validate in demo before live use.",
   "timeframe": "M15",
   "candle_count": 200,
   "entry_rules": {
     "long": {
       "conditions": [
-        { "indicator": "SMA", "period": 9, "comparison": "crosses_above", "reference": "SMA", "ref_period": 21 },
-        { "indicator": "RSI", "period": 14, "comparison": ">", "value": 50 },
-        { "indicator": "RSI", "period": 14, "comparison": "<", "value": 68 },
-        { "indicator": "ADX", "period": 14, "comparison": ">", "value": 20 }
+        {
+          "indicator": "SMA",
+          "period": 9,
+          "comparison": "crosses_above",
+          "reference": "SMA",
+          "ref_period": 21
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": ">",
+          "value": 50
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": "<",
+          "value": 80
+        },
+        {
+          "indicator": "ADX",
+          "period": 14,
+          "comparison": ">",
+          "value": 20
+        }
       ],
       "require_all": true
     },
     "short": {
       "conditions": [
-        { "indicator": "SMA", "period": 9, "comparison": "crosses_below", "reference": "SMA", "ref_period": 21 },
-        { "indicator": "RSI", "period": 14, "comparison": "<", "value": 50 },
-        { "indicator": "RSI", "period": 14, "comparison": ">", "value": 32 },
-        { "indicator": "ADX", "period": 14, "comparison": ">", "value": 20 }
+        {
+          "indicator": "SMA",
+          "period": 9,
+          "comparison": "crosses_below",
+          "reference": "SMA",
+          "ref_period": 21
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": "<",
+          "value": 50
+        },
+        {
+          "indicator": "RSI",
+          "period": 14,
+          "comparison": ">",
+          "value": 20
+        },
+        {
+          "indicator": "ADX",
+          "period": 14,
+          "comparison": ">",
+          "value": 20
+        }
       ],
       "require_all": true
     }
@@ -59,19 +101,19 @@
     "late_day_close_min_r": 0.5
   },
   "risk_management": {
-    "risk_per_trade_pct": 0.5,
+    "risk_per_trade_pct": 1.0,
     "max_daily_loss_pct": 2.0,
-    "max_open_trades": 3,
+    "max_open_trades": 4,
     "min_risk_reward": 1.5
   },
   "entry_guards": {
-    "max_signal_age_minutes": 4,
+    "max_signal_age_minutes": 5,
     "max_chase_atr": 0.5,
     "cooldown_minutes_after_loss": 90,
     "max_trades_per_symbol_per_day": 2,
     "max_consecutive_losses": 3,
-    "max_currency_net_exposure": 1,
-    "no_new_entries_minutes_before_flatten": 120
+    "max_currency_net_exposure": 2,
+    "no_new_entries_minutes_before_flatten": 90
   },
   "filters": {
     "spread_max_pips": 3.0,
@@ -96,9 +138,28 @@
     "USDJPY",
     "AUDUSD",
     "USDCAD",
+    "AUDCAD",
     "EURGBP",
+    "EURCAD",
+    "CADJPY",
     "EURJPY",
     "GBPJPY",
-    "AUDJPY"
-  ]
+    "AUDJPY",
+    "GBPCAD",
+    "GBPAUD",
+    "USDCNH",
+    "USDHKD",
+    "NZDUSD"
+  ],
+  "entry_modes": {
+    "pullback": {
+      "enabled": true,
+      "lookback_bars": 3,
+      "tolerance_atr": 0.25,
+      "min_adx": 20,
+      "rsi_min": 45,
+      "rsi_max": 85,
+      "min_gap_bars": 4
+    }
+  }
 }

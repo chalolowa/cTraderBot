@@ -5,7 +5,7 @@ against live market data. Fully dynamic — edit JSON to change strategy.
 import json
 import logging
 import os
-from typing import Any, ClassVar
+from typing import Any
 
 import pandas as pd
 
@@ -281,7 +281,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
     # Higher-timeframe trend filter, management and guard settings
     # ------------------------------------------------------------------
-    _TREND_DEFAULTS: ClassVar[dict[str, Any]] = {
+    _TREND_DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "timeframe": "H1",
         "candle_count": 150,
@@ -293,7 +293,7 @@ class StrategyEngine:
         "drift_lookback_bars": 12,
         "max_counter_drift_atr": 1.0,
     }
-    _MANAGEMENT_DEFAULTS: ClassVar[dict[str, Any]] = {
+    _MANAGEMENT_DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "breakeven_r": 1.0,
         "breakeven_buffer_r": 0.1,
@@ -308,7 +308,7 @@ class StrategyEngine:
         "late_day_close_minutes": 45,
         "late_day_close_min_r": 0.5,
     }
-    _GUARD_DEFAULTS: ClassVar[dict[str, Any]] = {
+    _GUARD_DEFAULTS: dict[str, Any] = {
         "max_signal_age_minutes": 4,
         "max_chase_atr": 0.5,
         "cooldown_minutes_after_loss": 90,
@@ -373,6 +373,55 @@ class StrategyEngine:
         if direction == "short" and drift > limit:
             return False, f"day drift {drift:+.2f} ATR is against a short"
         return True, "aligned"
+
+    _ENTRY_MODE_DEFAULTS: dict[str, Any] = {
+        "pullback": {
+            "enabled": True,
+            "lookback_bars": 3,
+            "tolerance_atr": 0.25,
+            "min_adx": 20,
+            "rsi_min": 45,
+            "rsi_max": 85,
+            "min_gap_bars": 4,
+        }
+    }
+
+    def get_pullback_config(self) -> dict[str, Any]:
+        cfg = dict(self._ENTRY_MODE_DEFAULTS["pullback"])
+        cfg.update(self.config.get("entry_modes", {}).get("pullback", {}))
+        return cfg
+
+    def evaluate_pullback(
+        self, analyzed_df: pd.DataFrame, direction: str
+    ) -> tuple[bool, dict[str, Any]]:
+        """Trend-continuation entry (see TechnicalAnalyzer.detect_pullback)."""
+        cfg = self.get_pullback_config()
+        if not cfg.get("enabled", True):
+            return False, {"reason": "pullback_disabled"}
+        result = self.ta.detect_pullback(
+            analyzed_df,
+            direction,
+            lookback_bars=int(cfg["lookback_bars"]),
+            tolerance_atr=float(cfg["tolerance_atr"]),
+            min_adx=float(cfg["min_adx"]),
+            rsi_min=float(cfg["rsi_min"]),
+            rsi_max=float(cfg["rsi_max"]),
+        )
+        signal = self.ta.get_latest_signal(analyzed_df)
+        atr_period = self.config.get("exit_rules", {}).get("stop_loss", {}).get("atr_period", 14)
+        metadata = {
+            "signal": signal,
+            "conditions": [
+                {"indicator": name, "comparison": "pullback", "expected": desc, "actual": ok, "result": ok}
+                for name, ok, desc in result["checks"]
+            ],
+            "all_met": result["matched"],
+            "strategy": self.config["name"],
+            "mode": "pullback",
+            "atr": signal.get(f"atr_{atr_period}", signal.get("atr_14")),
+            "enriched_df": analyzed_df,
+        }
+        return bool(result["matched"]), metadata
 
     def get_instruments(self) -> list[str]:
         return [item.replace("_", "").upper() for item in self.config.get("instruments", [])]
