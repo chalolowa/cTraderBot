@@ -37,8 +37,58 @@ class TradingCycle:
         self._pos_lock = asyncio.Lock()
         self._bar_cache: dict[str, dict[str, Any]] = {}
         self._ret_cache: dict[str, tuple[datetime, pd.Series]] = {}
+        self._pip_position: dict[str, int] = {}
         self._amend_warned = False
         self._notification_lock = asyncio.Lock()
+
+    @staticmethod
+    def _format_candle_bars(
+        candles: pd.DataFrame | None, digits: int, count: int = 3
+    ) -> str:
+        if candles is None or candles.empty:
+            return "unavailable"
+
+        rows: list[str] = []
+        for timestamp, candle in candles.tail(count).iterrows():
+            parts = [
+                f"{timestamp}",
+                *(
+                    f"{name[0].upper()}={float(candle[name]):.{digits}f}"
+                    for name in ("open", "high", "low", "close")
+                    if name in candle and pd.notna(candle[name])
+                ),
+            ]
+            volume_name = next(
+                (name for name in ("tick_volume", "volume") if name in candle),
+                None,
+            )
+            if volume_name and pd.notna(candle[volume_name]):
+                parts.append(f"V={float(candle[volume_name]):g}")
+            indicators = [
+                name
+                for name in candle.index
+                if name.upper().startswith(("RSI_", "ATR_", "ADX_"))
+                and pd.notna(candle[name])
+            ]
+            parts.extend(
+                f"{name}={float(candle[name]):.3f}" for name in indicators[:6]
+            )
+            rows.append(" ".join(parts))
+        return " ; ".join(rows) if rows else "unavailable"
+
+    @staticmethod
+    def _format_entry_conditions(conditions: Any) -> str:
+        if not isinstance(conditions, list) or not conditions:
+            return "unavailable"
+        return "; ".join(
+            f"{condition.get('indicator', '?')} "
+            f"{condition.get('comparison', '?')} "
+            f"expected={condition.get('expected', '?')} "
+            f"actual={condition.get('actual', '?')} "
+            f"pass={condition.get('result', '?')}"
+            for condition in conditions
+            if isinstance(condition, dict)
+        ) or "unavailable"
 
     async def start(self) -> None:
         self.running = True
@@ -291,6 +341,7 @@ class TradingCycle:
         tick = ctrader_client.get_tick(symbol)
         symbol_info = await ctrader_client.get_symbol_info(symbol)
         pip_factor = 10**symbol_info.pip_position
+        self._pip_position[symbol] = symbol_info.pip_position
         spread_pips = (float(tick.ask) - float(tick.bid)) * pip_factor
         max_spread = float(
             strategy_engine.config.get("filters", {}).get(
@@ -370,10 +421,37 @@ class TradingCycle:
             )
             return
 
-        # A16 logging: Immediately before place_market_order()
+        signal_bars = self._format_candle_bars(enriched_df, symbol_info.pip_position + 1)
+        signal_time = metadata.get("signal", {}).get("time", bar_key)
+        atr_pips = (
+            float(atr_val) * pip_factor
+            if atr_val is not None and not pd.isna(atr_val)
+            else None
+        )
+        atr_text = f"{atr_pips:.2f}p" if atr_pips is not None else "n/a"
+        _console(
+            f"ENTRY SIGNAL {symbol} {direction.upper()} "
+            f"strategy={metadata.get('strategy', strategy_engine.config.get('name'))} "
+            f"mode={metadata.get('mode', 'crossover')} timeframe={timeframe} "
+            f"signal_bar={signal_time} spread={spread_pips:.2f}p ATR={atr_text}",
+            level=logging.INFO,
+        )
+        _console(
+            f"ENTRY CONTEXT {symbol} conditions=[{self._format_entry_conditions(metadata.get('conditions'))}] "
+            f"signal_bars[{len(enriched_df.tail(3))}]=[{signal_bars}]",
+            level=logging.INFO,
+        )
+
+        # Immediately before submitting, include the planned price distances and risk.
         _console(
             f"Placing market order: symbol={symbol}, direction={direction}, "
-            f"volume={lots:.2f}, SL={stop_loss:.5f}, TP={take_profit:.5f}",
+            f"volume={lots:.2f} lots, entry_quote={entry_price:.{symbol_info.pip_position + 1}f}, "
+            f"SL={stop_loss:.{symbol_info.pip_position + 1}f} "
+            f"({risk * pip_factor:.1f}p), "
+            f"TP={take_profit:.{symbol_info.pip_position + 1}f} "
+            f"({reward * pip_factor:.1f}p), RR={rr_ratio:.2f}, "
+            f"risk_budget={balance * float(risk_pct) / 100.0:.2f} "
+            f"({float(risk_pct):.3f}% of balance={balance:.2f})",
             level=logging.INFO,
         )
 
@@ -399,11 +477,22 @@ class TradingCycle:
             )
         )
         await self._deliver_pending_trade_notifications()
-
-        # A18 logging: Order placed successfully
+        fill_sl_pips = abs(actual_fill_price - stop_loss) * pip_factor
+        fill_tp_pips = abs(take_profit - actual_fill_price) * pip_factor
+        signed_slippage_pips = (
+            (actual_fill_price - entry_price)
+            * pip_factor
+            * (1 if direction == "long" else -1)
+        )
         _console(
-            f"Order placed successfully: position_id={position_id}, fill_price={actual_fill_price:.5f}, "
-            f"SL={stop_loss:.5f}, TP={take_profit:.5f}",
+            f"POSITION OPENED id={position_id} {symbol} {direction.upper()} "
+            f"fill={actual_fill_price:.{symbol_info.pip_position + 1}f} "
+            f"quote={entry_price:.{symbol_info.pip_position + 1}f} "
+            f"adverse_slippage={signed_slippage_pips:+.2f}p "
+            f"size={lots:.2f} lots SL={stop_loss:.{symbol_info.pip_position + 1}f} "
+            f"({fill_sl_pips:.1f}p) TP={take_profit:.{symbol_info.pip_position + 1}f} "
+            f"({fill_tp_pips:.1f}p) spread={spread_pips:.2f}p "
+            f"ATR={atr_text}",
             level=logging.INFO,
         )
 
@@ -896,6 +985,7 @@ class TradingCycle:
 
         symbol_info = await ctrader_client.get_symbol_info(symbol)
         pip_factor = 10**symbol_info.pip_position
+        self._pip_position[symbol] = symbol_info.pip_position
         min_dist = float(cfg["min_stop_distance_pips"]) / pip_factor
         digits = symbol_info.pip_position + 1
 
@@ -985,10 +1075,22 @@ class TradingCycle:
             },
             aggregate_id=position_id,
         )
+        management_atr = f"{atr * pip_factor:.1f}p" if atr is not None else "n/a"
         _console(
-            f"Levels moved {symbol} #{position_id}: SL {current_stop:.5f}->{use_stop:.5f} "
-            f"TP {current_tp:.5f}->{use_tp:.5f} ({'+'.join(why)}, R={r_now:+.2f}, "
-            f"peak={peak_r:+.2f}R) [{broker_note}]",
+            f"POSITION MANAGEMENT {symbol} #{position_id} "
+            f"price={price:.{digits}f} R={r_now:+.2f} peak={peak_r:+.2f}R "
+            f"SL={current_stop:.{digits}f}->{use_stop:.{digits}f} "
+            f"(step={sign * (use_stop - current_stop) * pip_factor:+.1f}p, "
+            f"gap={abs(price - use_stop) * pip_factor:.1f}p) "
+            f"TP={current_tp:.{digits}f}->{use_tp:.{digits}f} "
+            f"(gap={abs(price - use_tp) * pip_factor:.1f}p) ATR={management_atr}",
+            level=logging.INFO,
+        )
+        _console(
+            f"MANAGEMENT CANDLE {symbol} #{position_id} "
+            f"close_time={analysis.get('bar_close') if analysis else 'unavailable'} "
+            f"bar=[{self._format_candle_bars(analyzed, digits, count=1)}] "
+            f"reason={'+'.join(why)} broker={broker_note}",
             level=logging.INFO,
         )
 
@@ -1020,8 +1122,82 @@ class TradingCycle:
         trade = risk_manager.get_trade(position_id)
         if reason is None:
             reason = self._infer_exit_reason(trade, float(exit_price))
-        risk_manager.record_exit(position_id, exit_price, pnl, reason)
+        r_multiple = risk_manager.record_exit(position_id, exit_price, pnl, reason)
         if trade is not None:
+            symbol = normalize_symbol(str(trade["instrument"]))
+            is_long = str(trade["direction"]).lower() in {"long", "buy"}
+            entry_price = float(trade["entry_price"])
+            pip_position = self._pip_position.get(symbol)
+            if pip_position is None:
+                try:
+                    symbol_info = await ctrader_client.get_symbol_info(symbol)
+                    pip_position = int(symbol_info.pip_position)
+                    self._pip_position[symbol] = pip_position
+                except (
+                    CTraderError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    _console(
+                        f"Exit diagnostics missing pip size for {symbol} "
+                        f"position_id={position_id}: {exc!r}",
+                        level=logging.WARNING,
+                    )
+            pips_text = "n/a"
+            if pip_position is not None:
+                signed_pips = (
+                    (float(exit_price) - entry_price)
+                    * (10**pip_position)
+                    * (1 if is_long else -1)
+                )
+                pips_text = f"{signed_pips:+.1f}p"
+
+            entry_time = risk_manager._parse_ts(trade.get("entry_time"))
+            hold_text = "unknown"
+            if entry_time is not None:
+                held = datetime.now(UTC) - entry_time
+                hold_seconds = max(0, int(held.total_seconds()))
+                hours, remainder = divmod(hold_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                hold_text = f"{hours}h{minutes:02d}m{seconds:02d}s"
+
+            bar_data = self._bar_cache.get(symbol)
+            if not bar_data or bar_data.get("analyzed") is None:
+                try:
+                    bar_data = await self._bar_analysis(symbol)
+                except (
+                    CTraderError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    _console(
+                        f"Exit candle diagnostics unavailable for {symbol} "
+                        f"position_id={position_id}: {exc!r}",
+                        level=logging.WARNING,
+                    )
+            bar_df = bar_data.get("analyzed") if bar_data else None
+            digits = (pip_position + 1) if pip_position is not None else 5
+            _console(
+                f"POSITION CLOSED id={position_id} {symbol} "
+                f"{str(trade['direction']).upper()} reason={reason} "
+                f"entry={entry_price:.{digits}f} exit={float(exit_price):.{digits}f} "
+                f"move={pips_text} gross_pnl={float(pnl):+.2f} "
+                f"R={r_multiple:+.2f} peak_R={float(trade.get('peak_r') or 0.0):+.2f} "
+                f"held={hold_text} initial_SL={float(trade.get('stop_loss') or 0.0):.{digits}f} "
+                f"current_SL={float(trade.get('current_stop') or trade.get('stop_loss') or 0.0):.{digits}f} "
+                f"current_TP={float(trade.get('current_tp') or trade.get('take_profit') or 0.0):.{digits}f}",
+                level=logging.INFO,
+            )
+            _console(
+                f"EXIT CANDLE CONTEXT id={position_id} {symbol} "
+                f"timeframe={strategy_engine.config.get('timeframe', 'M15')} "
+                f"bars=[{self._format_candle_bars(bar_df, digits)}]",
+                level=logging.INFO,
+            )
             await self._deliver_pending_trade_notifications()
 
     async def _deliver_pending_trade_notifications(self) -> None:

@@ -164,7 +164,9 @@
     "EURGBP",
     "EURJPY",
     "GBPJPY",
-    "AUDJPY"
+    "AUDJPY",
+    "USDCNH",
+    "GBPAUD"
   ],
   "entry_modes": {
     "pullback": {

@@ -662,13 +662,30 @@ class TradingCycleNotificationTests(IsolatedAsyncioTestCase):
 
     async def test_reconciled_bot_exit_sends_close_notification(self) -> None:
         cycle = TradingCycle()
+        cycle._pip_position["EURUSD"] = 4
         trade = {
             "instrument": "EURUSD",
             "direction": "long",
             "entry_price": 1.1,
             "stop_loss": 1.09,
             "take_profit": 1.13,
+            "current_stop": 1.115,
+            "current_tp": 1.13,
+            "peak_r": 2.5,
         }
+        candle_frame = pd.DataFrame(
+            [
+                {
+                    "open": 1.119,
+                    "high": 1.122,
+                    "low": 1.118,
+                    "close": 1.121,
+                    "tick_volume": 42,
+                    "RSI_14": 63.5,
+                }
+            ],
+            index=pd.DatetimeIndex([datetime(2026, 10, 21, 12, tzinfo=UTC)]),
+        )
         with (
             patch("src.trading_cycle.risk_manager.get_trade", return_value=trade),
             patch(
@@ -681,6 +698,12 @@ class TradingCycleNotificationTests(IsolatedAsyncioTestCase):
             patch.object(
                 cycle, "_deliver_pending_trade_notifications", new=AsyncMock()
             ) as deliver_pending,
+            patch.object(
+                cycle,
+                "_bar_analysis",
+                new=AsyncMock(return_value={"analyzed": candle_frame}),
+            ),
+            patch("src.trading_cycle._console") as log,
             patch(
                 "src.trading_cycle.telegram.send_message_async", new=AsyncMock()
             ) as send_message,
@@ -690,6 +713,35 @@ class TradingCycleNotificationTests(IsolatedAsyncioTestCase):
         record_exit.assert_called_once_with(12, 1.12, 20.0, "take_profit")
         deliver_pending.assert_awaited_once()
         send_message.assert_not_awaited()
+        logged = "\n".join(str(item.args[0]) for item in log.call_args_list)
+        self.assertIn("POSITION CLOSED id=12 EURUSD LONG", logged)
+        self.assertIn("move=+200.0p", logged)
+        self.assertIn("gross_pnl=+20.00", logged)
+        self.assertIn("O=1.11900 H=1.12200 L=1.11800 C=1.12100 V=42", logged)
+        self.assertIn("RSI_14=63.500", logged)
+
+    def test_candle_context_formats_recent_ohlcv(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {
+                    "open": 1.1,
+                    "high": 1.12,
+                    "low": 1.09,
+                    "close": 1.11,
+                    "tick_volume": 25,
+                    "ATR_14": 0.01,
+                    "ADX_14": 22.5,
+                }
+            ],
+            index=pd.DatetimeIndex([datetime(2026, 10, 21, 12, tzinfo=UTC)]),
+        )
+
+        formatted = TradingCycle._format_candle_bars(frame, digits=4)
+
+        self.assertIn("O=1.1000 H=1.1200 L=1.0900 C=1.1100", formatted)
+        self.assertIn("V=25", formatted)
+        self.assertIn("ATR_14=0.010", formatted)
+        self.assertIn("ADX_14=22.500", formatted)
 
     async def test_daily_summary_uses_today_and_is_only_sent_once(self) -> None:
         cycle = TradingCycle()
