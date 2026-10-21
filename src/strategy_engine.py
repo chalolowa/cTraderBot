@@ -5,7 +5,7 @@ against live market data. Fully dynamic — edit JSON to change strategy.
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 import pandas as pd
 
@@ -281,7 +281,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
     # Higher-timeframe trend filter, management and guard settings
     # ------------------------------------------------------------------
-    _TREND_DEFAULTS: dict[str, Any] = {
+    _TREND_DEFAULTS: ClassVar[dict[str, Any]] = {
         "enabled": True,
         "timeframe": "H1",
         "candle_count": 150,
@@ -293,7 +293,7 @@ class StrategyEngine:
         "drift_lookback_bars": 12,
         "max_counter_drift_atr": 1.0,
     }
-    _MANAGEMENT_DEFAULTS: dict[str, Any] = {
+    _MANAGEMENT_DEFAULTS: ClassVar[dict[str, Any]] = {
         "enabled": True,
         "breakeven_r": 1.0,
         "breakeven_buffer_r": 0.1,
@@ -307,15 +307,38 @@ class StrategyEngine:
         "late_day_lock_fraction": 0.5,
         "late_day_close_minutes": 45,
         "late_day_close_min_r": 0.5,
+        "management_interval_seconds": 10,
+        "software_stops": True,
+        "giveback_enabled": True,
+        "giveback_arm_r": 0.8,
+        "giveback_fraction": 0.5,
+        "reversal_exit_enabled": True,
+        "reversal_min_profit_r": 0.3,
+        "reversal_votes_required": 2,
+        "reversal_body_atr": 1.0,
+        "tp_adjust_enabled": True,
+        "tp_adjust_min_peak_r": 1.0,
+        "tp_fade_bars": 3,
+        "tp_near_atr": 1.0,
     }
-    _GUARD_DEFAULTS: dict[str, Any] = {
+    _GUARD_DEFAULTS: ClassVar[dict[str, Any]] = {
         "max_signal_age_minutes": 4,
         "max_chase_atr": 0.5,
         "cooldown_minutes_after_loss": 90,
         "max_trades_per_symbol_per_day": 2,
         "max_consecutive_losses": 3,
-        "max_currency_net_exposure": 1,
+        "max_currency_net_exposure": 3,
         "no_new_entries_minutes_before_flatten": 120,
+        "correlation_guard": {
+            "enabled": True,
+            "timeframe": "M15",
+            "lookback_bars": 200,
+            "min_overlap_bars": 60,
+            "max_effective_corr": 0.65,
+            "max_correlated_positions": 3,
+            "exclude_risk_free": True,
+            "cache_minutes": 15,
+        },
     }
 
     def get_trend_filter_config(self) -> dict[str, Any]:
@@ -335,7 +358,11 @@ class StrategyEngine:
 
     def get_guard_config(self) -> dict[str, Any]:
         cfg = dict(self._GUARD_DEFAULTS)
-        cfg.update(self.config.get("entry_guards", {}))
+        user = self.config.get("entry_guards", {})
+        cfg.update({k: v for k, v in user.items() if k != "correlation_guard"})
+        corr = dict(self._GUARD_DEFAULTS["correlation_guard"])
+        corr.update(user.get("correlation_guard", {}))
+        cfg["correlation_guard"] = corr
         return cfg
 
     def compute_htf_bias(self, htf_df: pd.DataFrame) -> dict[str, Any]:
@@ -374,7 +401,7 @@ class StrategyEngine:
             return False, f"day drift {drift:+.2f} ATR is against a short"
         return True, "aligned"
 
-    _ENTRY_MODE_DEFAULTS: dict[str, Any] = {
+    _ENTRY_MODE_DEFAULTS: ClassVar[dict[str, Any]] = {
         "pullback": {
             "enabled": True,
             "lookback_bars": 3,

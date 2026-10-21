@@ -1,6 +1,6 @@
 {
-  "name": "DayTrader_SMA_RSI_V4_TrendGated",
-  "description": "M15 entries (SMA 9/21 crossover OR pullback-continuation) gated by the H1 trend; breakeven/ATR-trail/late-day profit management; anti-whipsaw guards. Validate in demo before live use.",
+  "name": "DayTrader_SMA_RSI_V5_ProfitProtect",
+  "description": "M15 crossover or pullback-continuation entries gated by the H1 trend; correlation limits; profit-protection management (breakeven, give-back stop, ATR trail, reversal exits, dynamic take-profit) enforced by the bot as well as the broker. Validate in demo before live use.",
   "timeframe": "M15",
   "candle_count": 200,
   "entry_rules": {
@@ -73,7 +73,7 @@
     },
     "take_profit": {
       "type": "RISK_REWARD",
-      "risk_reward_ratio": 3.0
+      "risk_reward_ratio": 2.5
     },
     "time_exit": {
       "close_before_market_close": true,
@@ -98,12 +98,25 @@
     "late_day_lock_min_r": 0.3,
     "late_day_lock_fraction": 0.5,
     "late_day_close_minutes": 45,
-    "late_day_close_min_r": 0.5
+    "late_day_close_min_r": 0.5,
+    "management_interval_seconds": 10,
+    "software_stops": true,
+    "giveback_enabled": true,
+    "giveback_arm_r": 0.8,
+    "giveback_fraction": 0.5,
+    "reversal_exit_enabled": true,
+    "reversal_min_profit_r": 0.3,
+    "reversal_votes_required": 2,
+    "reversal_body_atr": 1.0,
+    "tp_adjust_enabled": true,
+    "tp_adjust_min_peak_r": 1.0,
+    "tp_fade_bars": 3,
+    "tp_near_atr": 1.0
   },
   "risk_management": {
     "risk_per_trade_pct": 1.0,
     "max_daily_loss_pct": 2.0,
-    "max_open_trades": 4,
+    "max_open_trades": 5,
     "min_risk_reward": 1.5
   },
   "entry_guards": {
@@ -112,8 +125,18 @@
     "cooldown_minutes_after_loss": 90,
     "max_trades_per_symbol_per_day": 2,
     "max_consecutive_losses": 3,
-    "max_currency_net_exposure": 2,
-    "no_new_entries_minutes_before_flatten": 90
+    "max_currency_net_exposure": 3,
+    "no_new_entries_minutes_before_flatten": 90,
+    "correlation_guard": {
+      "enabled": true,
+      "timeframe": "M15",
+      "lookback_bars": 200,
+      "min_overlap_bars": 60,
+      "max_effective_corr": 0.65,
+      "cache_minutes": 15,
+      "max_correlated_positions": 3,
+      "exclude_risk_free": true
+    }
   },
   "filters": {
     "spread_max_pips": 3.0,
@@ -138,18 +161,10 @@
     "USDJPY",
     "AUDUSD",
     "USDCAD",
-    "AUDCAD",
     "EURGBP",
-    "EURCAD",
-    "CADJPY",
     "EURJPY",
     "GBPJPY",
-    "AUDJPY",
-    "GBPCAD",
-    "GBPAUD",
-    "USDCNH",
-    "USDHKD",
-    "NZDUSD"
+    "AUDJPY"
   ],
   "entry_modes": {
     "pullback": {

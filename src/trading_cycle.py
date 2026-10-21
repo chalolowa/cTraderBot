@@ -32,18 +32,28 @@ class TradingCycle:
         self._evaluated_bar: dict[str, str] = {}
         # Short-lived cache of higher-timeframe bias per symbol.
         self._htf_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        # Serialises everything that closes/records positions (tick flatten, reconcile,
+        # fast management loop) so one exit can never be recorded twice.
+        self._pos_lock = asyncio.Lock()
+        self._bar_cache: dict[str, dict[str, Any]] = {}
+        self._ret_cache: dict[str, tuple[datetime, pd.Series]] = {}
+        self._amend_warned = False
 
     async def start(self) -> None:
         self.running = True
         _console("cTraderbot loop started", level=logging.INFO)
         await telegram.send_message_async("auto trading initiated....")
-        while self.running:
-            try:
-                await self._tick()
-            except Exception as exc:
-                _console(f"Trading cycle tick error: {exc}", level=logging.ERROR)
-                await telegram.send_message_async(f"Cycle error: {exc}")
-            await asyncio.sleep(60)
+        mgmt_task = asyncio.create_task(self._management_loop())
+        try:
+            while self.running:
+                try:
+                    await self._tick()
+                except Exception as exc:
+                    _console(f"Trading cycle tick error: {exc}", level=logging.ERROR)
+                    await telegram.send_message_async(f"Cycle error: {exc}")
+                await asyncio.sleep(60)
+        finally:
+            mgmt_task.cancel()
 
     async def _tick(self) -> None:
         await self._reconcile_exits()
@@ -53,11 +63,11 @@ class TradingCycle:
                 "Close window active — flattening all positions", level=logging.INFO
             )
             await self._close_all_positions("market_close")
+            await self.send_daily_summary()
             return
 
-        # Keep analysing positions that are already open (breakeven, trail,
-        # profit lock, reversal exits). Runs even when new entries are blocked.
-        await self._manage_open_positions()
+        # Open positions are managed by _management_loop (every few seconds), so
+        # a slow scan here can never delay a protective exit.
 
         can_open = market_hours.can_open_new_trade()
         if not can_open.get("allowed", False):
@@ -435,6 +445,20 @@ class TradingCycle:
         return bias
 
     @staticmethod
+    def _is_risk_free(trade: dict[str, Any]) -> bool:
+        """True once the (enforced) stop sits at or beyond entry: the trade can no longer lose."""
+        try:
+            entry = float(trade["entry_price"])
+            stop = trade.get("current_stop")
+            if stop is None:
+                return False
+            stop = float(stop)
+        except (KeyError, TypeError, ValueError):
+            return False
+        is_long = str(trade["direction"]).lower() in {"long", "buy"}
+        return stop >= entry if is_long else stop <= entry
+
+    @staticmethod
     def _currency_exposure_block(
         symbol: str, direction: str, open_trades: list[dict[str, Any]], limit: int
     ) -> str | None:
@@ -510,16 +534,121 @@ class TradingCycle:
         exposure = self._currency_exposure_block(
             symbol,
             direction,
-            risk_manager.get_open_trades(),
+            [
+                t
+                for t in risk_manager.get_open_trades()
+                if not (
+                    guards["correlation_guard"].get("exclude_risk_free", True)
+                    and self._is_risk_free(t)
+                )
+            ],
             int(guards["max_currency_net_exposure"]),
         )
         if exposure:
             return f"correlation: {exposure}"
+
+        # 5. Measured correlation: same-direction trades on pairs that move together
+        #    (e.g. EURCAD + GBPCAD) are one bet taken twice.
+        corr_block = await self._correlation_block(symbol, direction)
+        if corr_block:
+            return f"correlation: {corr_block}"
+        return None
+
+    async def _returns(self, symbol: str, cfg: dict[str, Any]) -> pd.Series | None:
+        now = datetime.now(UTC)
+        cached = self._ret_cache.get(symbol)
+        if (
+            cached
+            and (now - cached[0]).total_seconds() < float(cfg["cache_minutes"]) * 60
+        ):
+            return cached[1]
+        try:
+            df = await fetch_closed_candles(
+                symbol, cfg["timeframe"], int(cfg["lookback_bars"])
+            )
+        except Exception as exc:
+            _console(
+                f"Correlation data unavailable for {symbol}: {exc}",
+                level=logging.WARNING,
+            )
+            return None
+        if df is None or len(df) < 30:
+            return None
+        series = df["close"].astype(float).pct_change().dropna()
+        self._ret_cache[symbol] = (now, series)
+        return series
+
+    async def _correlation_block(self, symbol: str, direction: str) -> str | None:
+        """
+        Cap how many open positions may be the same bet. A position counts as correlated
+        when the measured return correlation, signed by both trade directions, is at or
+        above `max_effective_corr`. A new trade is refused once `max_correlated_positions`
+        correlated positions are already open. Positions whose stop is locked at/beyond
+        breakeven carry no risk and are not counted (exclude_risk_free).
+        """
+        cfg = strategy_engine.get_guard_config()["correlation_guard"]
+        if not cfg.get("enabled", True):
+            return None
+        cap = int(cfg.get("max_correlated_positions", 3))
+        open_trades = [
+            t
+            for t in risk_manager.get_open_trades()
+            if normalize_symbol(t["instrument"]) != symbol
+        ]
+        if cfg.get("exclude_risk_free", True):
+            open_trades = [t for t in open_trades if not self._is_risk_free(t)]
+        if not open_trades:
+            return None
+        mine = await self._returns(symbol, cfg)
+        if mine is None:
+            return None
+        my_sign = 1.0 if direction == "long" else -1.0
+        correlated: list[str] = []
+        for trade in open_trades:
+            other_sym = normalize_symbol(trade["instrument"])
+            other = await self._returns(other_sym, cfg)
+            if other is None:
+                continue
+            joined = pd.concat([mine, other], axis=1, join="inner").dropna()
+            if len(joined) < int(cfg["min_overlap_bars"]):
+                continue
+            corr = float(joined.iloc[:, 0].corr(joined.iloc[:, 1]))
+            other_sign = (
+                1.0 if str(trade["direction"]).lower() in {"long", "buy"} else -1.0
+            )
+            effective = (
+                corr * my_sign * other_sign
+            )  # > 0 means both trades win/lose together
+            if effective >= float(cfg["max_effective_corr"]):
+                correlated.append(
+                    f"{other_sym} {trade['direction']} ({effective:+.2f})"
+                )
+        if len(correlated) >= cap:
+            return (
+                f"{symbol} {direction} would be correlated position #{len(correlated) + 1} "
+                f"(cap {cap}; open: {', '.join(correlated)})"
+            )
         return None
 
     # ------------------------------------------------------------------
     # Management of open positions
     # ------------------------------------------------------------------
+    async def _management_loop(self) -> None:
+        """Fast loop (seconds, not minutes) that protects open trades."""
+        while self.running:
+            try:
+                await self._manage_open_positions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let one bad cycle kill protection
+                _console(f"Management loop error: {exc!r}", level=logging.ERROR)
+            interval = float(
+                strategy_engine.get_management_config().get(
+                    "management_interval_seconds", 10
+                )
+            )
+            await asyncio.sleep(max(2.0, interval))
+
     async def _manage_open_positions(self) -> None:
         cfg = strategy_engine.get_management_config()
         if not cfg.get("enabled", True):
@@ -527,32 +656,25 @@ class TradingCycle:
         open_trades = risk_manager.get_open_trades()
         if not open_trades:
             return
-        try:
-            broker_ids = {
-                int(p.position_id) for p in await ctrader_client.get_bot_positions()
-            }
-        except (CTraderError, RuntimeError, ValueError) as exc:
-            _console(f"Position management skipped: {exc}", level=logging.WARNING)
-            return
-        minutes_left = market_hours.time_until_close().total_seconds() / 60.0
-
-        for trade in open_trades:
-            if int(trade["trade_id"]) not in broker_ids:
-                continue
+        async with self._pos_lock:
             try:
-                await self._manage_one(trade, cfg, minutes_left)
-            except (
-                CTraderError,
-                RuntimeError,
-                ValueError,
-                KeyError,
-                TypeError,
-                sqlite3.Error,
-            ) as exc:
-                _console(
-                    f"Management error for position {trade.get('trade_id')}: {exc}",
-                    level=logging.ERROR,
-                )
+                broker_ids = {
+                    int(p.position_id) for p in await ctrader_client.get_bot_positions()
+                }
+            except Exception as exc:
+                _console(f"Position management skipped: {exc!r}", level=logging.WARNING)
+                return
+            minutes_left = market_hours.time_until_close().total_seconds() / 60.0
+            for trade in open_trades:
+                if int(trade["trade_id"]) not in broker_ids:
+                    continue
+                try:
+                    await self._manage_one(trade, cfg, minutes_left)
+                except Exception as exc:  # incl. AttributeError: log loudly, keep going
+                    _console(
+                        f"Management error for position {trade.get('trade_id')}: {exc!r}",
+                        level=logging.ERROR,
+                    )
 
     async def _close_managed(
         self, position_id: int, symbol: str, reason: str, r_now: float, peak_r: float
@@ -576,9 +698,44 @@ class TradingCycle:
             f"(R={r_now:+.2f}, peak={peak_r:+.2f}R)",
             level=logging.INFO,
         )
-        await telegram.send_message_async(
-            f"EXIT {symbol} #{position_id}: {reason} (R={r_now:+.2f}, peak {peak_r:+.2f}R)"
+
+    async def _bar_analysis(self, symbol: str) -> dict[str, Any] | None:
+        """Indicators on the latest closed candle, refreshed once per candle (not every 10 s)."""
+        timeframe = strategy_engine.config.get("timeframe", "M15")
+        tf_min = timeframe_minutes(timeframe)
+        now = datetime.now(UTC)
+        bar_key = pd.Timestamp(now).floor(f"{tf_min}min")
+        cached = self._bar_cache.get(symbol)
+        if cached and cached["bar_key"] == bar_key and (
+            cached["lag_bars"] == 0
+            or (now - cached["fetched_at"]).total_seconds() < 30
+        ):
+            return cached
+        candle_count = int(strategy_engine.config.get("candle_count", 200))
+        df = await fetch_closed_candles(symbol, timeframe, candle_count)
+        if df is None or df.empty or len(df) < 30:
+            return None
+        analyzed = strategy_engine.ta.analyze_instrument(df, strategy_engine.config)
+        atr_period = int(
+            strategy_engine.config["exit_rules"]["stop_loss"].get("atr_period", 14)
         )
+        atr_raw = analyzed.iloc[-1].get(f"ATR_{atr_period}")
+        atr = (
+            float(atr_raw)
+            if atr_raw is not None and not pd.isna(atr_raw) and float(atr_raw) > 0
+            else None
+        )
+        last_open = self._to_utc(analyzed.index[-1])
+        entry = {
+            "bar_key": bar_key,
+            "fetched_at": now,
+            "lag_bars": int(df.attrs.get("lag_bars", 0)),
+            "analyzed": analyzed,
+            "atr": atr,
+            "bar_close": last_open + timedelta(minutes=tf_min) if last_open else None,
+        }
+        self._bar_cache[symbol] = entry
+        return entry
 
     async def _manage_one(
         self, trade: dict[str, Any], cfg: dict[str, Any], minutes_left: float
@@ -589,11 +746,11 @@ class TradingCycle:
         sign = 1.0 if is_long else -1.0
         entry = float(trade["entry_price"])
         initial_stop = float(trade["stop_loss"])
-        take_profit = float(trade["take_profit"])
         risk = abs(entry - initial_stop)
         if risk <= 0:
             return
         current_stop = float(trade.get("current_stop") or initial_stop)
+        current_tp = float(trade.get("current_tp") or trade["take_profit"])
 
         tick = ctrader_client.get_tick(symbol)
         price = float(tick.bid if is_long else tick.ask)  # the side we would exit on
@@ -612,6 +769,27 @@ class TradingCycle:
             position_id, peak_r=peak_r, peak_price=peak_price
         )
 
+        # 0. Software stop / target: the bot enforces the CURRENT levels itself, so
+        #    trailing still protects the trade if the broker amend is missing or failed.
+        if cfg.get("software_stops", True):
+            if (is_long and price <= current_stop) or (
+                not is_long and price >= current_stop
+            ):
+                label = (
+                    "stop_loss"
+                    if abs(current_stop - initial_stop) <= 0.05 * risk
+                    else "trailing_stop"
+                )
+                await self._close_managed(position_id, symbol, label, r_now, peak_r)
+                return
+            if (is_long and price >= current_tp) or (
+                not is_long and price <= current_tp
+            ):
+                await self._close_managed(
+                    position_id, symbol, "take_profit", r_now, peak_r
+                )
+                return
+
         # 1. Late in the day: bank open profit instead of handing it back at the flatten.
         if minutes_left <= float(cfg["late_day_close_minutes"]) and r_now >= float(
             cfg["late_day_close_min_r"]
@@ -621,34 +799,47 @@ class TradingCycle:
             )
             return
 
-        # 2. Fresh view of the market for this open trade.
-        timeframe = strategy_engine.config.get("timeframe", "M15")
-        candle_count = int(strategy_engine.config.get("candle_count", 200))
-        df = await fetch_closed_candles(symbol, timeframe, candle_count)
-        atr = None
-        opposite_cross = False
-        if not df.empty and len(df) >= 30:
-            analyzed = strategy_engine.ta.analyze_instrument(df, strategy_engine.config)
+        # 2. Reading the market again: reversal signs on candles that closed AFTER entry.
+        analysis = await self._bar_analysis(symbol)
+        analyzed = analysis["analyzed"] if analysis else None
+        atr = analysis["atr"] if analysis else None
+        entry_time = risk_manager._parse_ts(trade.get("entry_time"))
+        fresh_bar = bool(
+            analysis
+            and analysis["bar_close"]
+            and entry_time
+            and analysis["bar_close"] > entry_time
+        )
+
+        if analyzed is not None and fresh_bar:
             latest = analyzed.iloc[-1]
-            atr_period = int(
-                strategy_engine.config["exit_rules"]["stop_loss"].get("atr_period", 14)
-            )
-            atr_raw = latest.get(f"ATR_{atr_period}")
-            if atr_raw is not None and not pd.isna(atr_raw) and float(atr_raw) > 0:
-                atr = float(atr_raw)
             opposite_cross = bool(
                 latest.get("crossover_down" if is_long else "crossover_up", False)
             )
-
-        if (
-            cfg["exit_on_opposite_cross_in_profit"]
-            and opposite_cross
-            and r_now >= float(cfg["min_profit_r_for_signal_exit"])
-        ):
-            await self._close_managed(
-                position_id, symbol, "reversal_in_profit", r_now, peak_r
-            )
-            return
+            if (
+                cfg["exit_on_opposite_cross_in_profit"]
+                and opposite_cross
+                and r_now >= float(cfg["min_profit_r_for_signal_exit"])
+            ):
+                await self._close_managed(
+                    position_id, symbol, "reversal_in_profit", r_now, peak_r
+                )
+                return
+            if cfg["reversal_exit_enabled"] and r_now >= float(
+                cfg["reversal_min_profit_r"]
+            ):
+                rv = strategy_engine.ta.reversal_votes(
+                    analyzed, is_long, body_atr=float(cfg["reversal_body_atr"])
+                )
+                if rv["votes"] >= int(cfg["reversal_votes_required"]):
+                    _console(
+                        f"Reversal detected {symbol} #{position_id}: {rv['detail']}",
+                        level=logging.INFO,
+                    )
+                    await self._close_managed(
+                        position_id, symbol, "reversal_exit", r_now, peak_r
+                    )
+                    return
 
         if cfg["exit_on_htf_flip"] and strategy_engine.get_trend_filter_config().get(
             "enabled", True
@@ -660,14 +851,14 @@ class TradingCycle:
                 )
                 return
 
-        # 3. Ratchet the stop (never loosen it).
+        # 3. Ratchet the stop (never loosen it) and pull the target closer when momentum fades.
         def tighter(a: float, b: float) -> float:
             return max(a, b) if is_long else min(a, b)
 
-        new_stop = current_stop
+        new_stop, new_tp = current_stop, current_tp
         why: list[str] = []
 
-        def propose(label: str, level: float) -> None:
+        def propose_stop(label: str, level: float) -> None:
             nonlocal new_stop
             candidate = tighter(new_stop, level)
             if candidate != new_stop:
@@ -675,22 +866,49 @@ class TradingCycle:
                 why.append(label)
 
         if peak_r >= float(cfg["breakeven_r"]):
-            propose("breakeven", entry + sign * float(cfg["breakeven_buffer_r"]) * risk)
+            propose_stop(
+                "breakeven", entry + sign * float(cfg["breakeven_buffer_r"]) * risk
+            )
+        if cfg["giveback_enabled"] and peak_r >= float(cfg["giveback_arm_r"]):
+            keep = peak_r * (1.0 - float(cfg["giveback_fraction"]))
+            propose_stop("giveback", entry + sign * keep * risk)
         if (
             cfg["trail_enabled"]
             and atr is not None
             and peak_r >= float(cfg["trail_start_r"])
         ):
-            propose("atr_trail", peak_price - sign * float(cfg["trail_atr_mult"]) * atr)
+            propose_stop(
+                "atr_trail", peak_price - sign * float(cfg["trail_atr_mult"]) * atr
+            )
         if minutes_left <= float(cfg["late_day_lock_minutes"]) and r_now >= float(
             cfg["late_day_lock_min_r"]
         ):
-            propose(
+            propose_stop(
                 "late_day_lock",
                 entry + float(cfg["late_day_lock_fraction"]) * (price - entry),
             )
 
-        if not why:
+        symbol_info = await ctrader_client.get_symbol_info(symbol)
+        pip_factor = 10**symbol_info.pip_position
+        min_dist = float(cfg["min_stop_distance_pips"]) / pip_factor
+        digits = symbol_info.pip_position + 1
+
+        if (
+            cfg["tp_adjust_enabled"]
+            and analyzed is not None
+            and atr is not None
+            and peak_r >= float(cfg["tp_adjust_min_peak_r"])
+            and strategy_engine.ta.momentum_fading(
+                analyzed, is_long, bars=int(cfg["tp_fade_bars"])
+            )
+        ):
+            candidate_tp = price + sign * float(cfg["tp_near_atr"]) * atr
+            closer = candidate_tp < new_tp if is_long else candidate_tp > new_tp
+            if closer and abs(candidate_tp - price) >= min_dist:
+                new_tp = candidate_tp
+                why.append("tp_compress")
+
+        if new_stop == current_stop and new_tp == current_tp:
             return
 
         if (is_long and new_stop >= price) or (not is_long and new_stop <= price):
@@ -700,40 +918,71 @@ class TradingCycle:
             )
             return
 
-        symbol_info = await ctrader_client.get_symbol_info(symbol)
-        pip_factor = 10**symbol_info.pip_position
-        if abs(price - new_stop) * pip_factor < float(cfg["min_stop_distance_pips"]):
+        new_stop, new_tp = round(new_stop, digits), round(new_tp, digits)
+        step = float(cfg["min_stop_step_r"]) * risk
+        stop_moved = abs(new_stop - current_stop) >= step
+        tp_moved = abs(new_tp - current_tp) >= step
+        if not (stop_moved or tp_moved):
             return
-        new_stop = round(new_stop, symbol_info.pip_position + 1)
-        if abs(new_stop - current_stop) < float(cfg["min_stop_step_r"]) * risk:
-            return
+        use_stop = new_stop if stop_moved else current_stop
+        use_tp = new_tp if tp_moved else current_tp
 
-        # amend replaces BOTH levels, so always send the existing take profit too.
-        await ctrader_client.amend_position_sltp(
-            position_id, stop_loss=new_stop, take_profit=take_profit
+        # Persist first: these levels are what the software enforcement above uses,
+        # whether or not the broker accepts the amend.
+        risk_manager.update_trade_management(
+            position_id, current_stop=use_stop, current_tp=use_tp
         )
-        risk_manager.update_trade_management(position_id, current_stop=new_stop)
+        broker_note = "broker updated"
+        if abs(price - use_stop) < min_dist or abs(price - use_tp) < min_dist:
+            broker_note = "too close to price for broker, software level only"
+        else:
+            try:
+                # amend replaces BOTH levels, so always send both.
+                await ctrader_client.amend_position_sltp(
+                    position_id, stop_loss=use_stop, take_profit=use_tp
+                )
+            except Exception as exc:
+                broker_note = (
+                    f"BROKER AMEND FAILED ({exc!r}); bot enforces level in software"
+                )
+                _console(
+                    f"Amend failed for {symbol} #{position_id}: {exc!r}",
+                    level=logging.ERROR,
+                )
+                if not self._amend_warned:
+                    self._amend_warned = True
+                    await telegram.send_message_async(
+                        f"WARNING: stop/TP amend failed ({exc!r}). Trailing now runs in software only."
+                    )
         risk_manager.record_event(
             "trade_management",
             {
                 "position_id": position_id,
                 "instrument": symbol,
-                "action": "amend_stop",
+                "action": "amend_levels",
                 "old_stop": current_stop,
-                "new_stop": new_stop,
+                "new_stop": use_stop,
+                "old_tp": current_tp,
+                "new_tp": use_tp,
                 "why": why,
+                "note": broker_note,
                 "r_now": round(r_now, 2),
                 "peak_r": round(peak_r, 2),
             },
             aggregate_id=position_id,
         )
         _console(
-            f"Stop moved {symbol} #{position_id}: {current_stop:.5f} -> {new_stop:.5f} "
-            f"({'+'.join(why)}, R={r_now:+.2f}, peak={peak_r:+.2f}R)",
+            f"Levels moved {symbol} #{position_id}: SL {current_stop:.5f}->{use_stop:.5f} "
+            f"TP {current_tp:.5f}->{use_tp:.5f} ({'+'.join(why)}, R={r_now:+.2f}, "
+            f"peak={peak_r:+.2f}R) [{broker_note}]",
             level=logging.INFO,
         )
 
     async def _close_all_positions(self, reason: str) -> None:
+        async with self._pos_lock:
+            await self._close_all_positions_locked(reason)
+
+    async def _close_all_positions_locked(self, reason: str) -> None:
         for position in await ctrader_client.get_bot_positions():
             position_id = int(position.position_id)
             try:
@@ -753,12 +1002,18 @@ class TradingCycle:
                 )
 
     async def _record_exit(self, position_id: int, reason: str | None) -> None:
+        trade = risk_manager.get_trade(position_id)
         exit_price, pnl = await ctrader_client.get_closed_position_summary(position_id)
         if reason is None:
-            reason = self._infer_exit_reason(
-                risk_manager.get_trade(position_id), float(exit_price)
+            reason = self._infer_exit_reason(trade, float(exit_price))
+        r_multiple = risk_manager.record_exit(position_id, exit_price, pnl, reason)
+        if trade is not None:
+            await telegram.send_message_async(
+                f"CLOSED {trade['instrument']} #{position_id} "
+                f"{str(trade['direction']).upper()} | {reason} | "
+                f"exit={float(exit_price):.5f} | P&amp;L={float(pnl):+.2f} | "
+                f"R={r_multiple:+.2f}"
             )
-        risk_manager.record_exit(position_id, exit_price, pnl, reason)
 
     @staticmethod
     def _infer_exit_reason(trade: dict[str, Any] | None, exit_price: float) -> str:
@@ -768,14 +1023,15 @@ class TradingCycle:
         try:
             entry = float(trade["entry_price"])
             initial_stop = float(trade["stop_loss"])
-            tp = float(trade["take_profit"])
+            tp = float(trade.get("current_tp") or trade["take_profit"])
+            original_tp = float(trade["take_profit"])
             current_stop = float(trade.get("current_stop") or initial_stop)
         except (KeyError, TypeError, ValueError):
             return "broker_exit"
         tol = 0.15 * abs(entry - initial_stop)
         if tol <= 0:
             return "broker_exit"
-        if abs(exit_price - tp) <= tol:
+        if abs(exit_price - tp) <= tol or abs(exit_price - original_tp) <= tol:
             return "take_profit"
         if abs(exit_price - current_stop) <= tol:
             return (
@@ -786,6 +1042,10 @@ class TradingCycle:
         return "broker_exit"
 
     async def _reconcile_exits(self) -> None:
+        async with self._pos_lock:
+            await self._reconcile_exits_locked()
+
+    async def _reconcile_exits_locked(self) -> None:
         broker_positions = await ctrader_client.get_bot_positions()
         broker_position_ids = {position.position_id for position in broker_positions}
         for trade in risk_manager.get_open_trades():
@@ -805,16 +1065,38 @@ class TradingCycle:
                 )
 
     async def send_daily_summary(self) -> None:
+        summary_day = market_hours.now_est().date().isoformat()
+        if risk_manager.daily_summary_exists(summary_day):
+            return
+
         try:
             account = await ctrader_client.get_account_info()
-            balance = float(account.balance)
-        except Exception:
-            balance = 0.0
-        stats = risk_manager.get_r_multiple_stats()
+            balance_text = f"{float(account.balance):.2f}"
+        except (CTraderError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            _console(f"Unable to fetch balance for daily summary: {exc}", level=logging.WARNING)
+            balance_text = "unavailable"
+
+        trades = risk_manager.get_today_closed_trades()
+        pnl = sum(float(trade.get("pnl") or 0.0) for trade in trades)
+        r_values = [float(trade.get("r_multiple") or 0.0) for trade in trades]
+        wins = sum(value > 0 for value in r_values)
+        losses = sum(value < 0 for value in r_values)
+        non_break_even = wins + losses
+        win_rate = wins / non_break_even * 100 if non_break_even else 0.0
+        cumulative_r = 0.0
+        peak_r = 0.0
+        max_drawdown = 0.0
+        for value in r_values:
+            cumulative_r += value
+            peak_r = max(peak_r, cumulative_r)
+            max_drawdown = max(max_drawdown, peak_r - cumulative_r)
         summary_text = (
-            f"Daily summary: balance={balance:.2f}, "
-            f"trades={stats['total_trades']}, total R={stats['total_r']:+.2f}, "
-            f"win_rate={stats['win_rate']}%, max_drawdown={stats['max_r_drawdown']}R"
+            f"<b>Daily Summary · {summary_day} ET</b>\n"
+            f"Balance: {balance_text}\n"
+            f"Closed bot trades: {len(trades)} (wins {wins}, losses {losses})\n"
+            f"Realized P&amp;L: {pnl:+.2f}\n"
+            f"Net R: {cumulative_r:+.2f} | Win rate: {win_rate:.1f}%\n"
+            f"Max R drawdown: {max_drawdown:.2f}"
         )
         _console(summary_text, level=logging.INFO)
         await telegram.send_daily_summary_async(summary_text)

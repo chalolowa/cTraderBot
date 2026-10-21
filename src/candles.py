@@ -55,7 +55,7 @@ async def fetch_closed_candles(
     if tf_min < 1440:
         expected_open = now_ts.floor(f"{tf_min}min") - pd.Timedelta(minutes=tf_min)
         last_open = idx[closed][-1]
-        lag_bars = max(0, int(round((expected_open - last_open).total_seconds() / 60 / tf_min)))
+        lag_bars = max(0, round((expected_open - last_open).total_seconds() / 60 / tf_min))
     df.attrs["lag_bars"] = lag_bars
 
     key = (symbol, timeframe)

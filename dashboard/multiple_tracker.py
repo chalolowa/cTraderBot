@@ -66,9 +66,9 @@ async def dashboard_home():
     <div><span id="connection" class="status">Connecting to cTrader…</span><br><button id="refresh">Refresh</button></div>
   </header>
   <div class="grid">
-    <div class="card"><div class="label">Balance · account units</div><div id="balance" class="value">—</div></div>
-    <div class="card"><div class="label">Estimated equity</div><div id="equity" class="value">—</div></div>
-    <div class="card"><div class="label">Open P&amp;L</div><div id="open-pnl" class="value">—</div></div>
+    <div class="card"><div class="label">Account balance · all account activity</div><div id="balance" class="value">—</div></div>
+    <div class="card"><div class="label">Estimated balance + bot open P&amp;L</div><div id="equity" class="value">—</div></div>
+    <div class="card"><div class="label">Bot open P&amp;L</div><div id="open-pnl" class="value">—</div></div>
     <div class="card"><div class="label">Realized P&amp;L · last <span id="period-label">30</span> days</div><div id="realized-pnl" class="value">—</div></div>
     <div class="card"><div class="label">Open positions</div><div id="open-count" class="value">—</div></div>
     <div class="card"><div class="label">Closed positions · period</div><div id="closed-count" class="value">—</div></div>
@@ -76,11 +76,11 @@ async def dashboard_home():
     <div class="card"><div class="label">Bot win rate · 30 days</div><div id="win-rate" class="value">—</div></div>
   </div>
   <section>
-    <div class="section-head"><h2>Open positions · live from cTrader</h2><span id="updated" class="muted">—</span></div>
+    <div class="section-head"><h2>Open bot positions · live from cTrader</h2><span id="updated" class="muted">—</span></div>
     <div class="table-wrap"><table><thead><tr><th>Position</th><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Stop loss</th><th>Take profit</th><th>Net unrealized P&amp;L</th></tr></thead><tbody id="open-rows"><tr><td class="empty" colspan="8">Loading positions…</td></tr></tbody></table></div>
   </section>
   <section>
-    <div class="section-head"><h2>Closed positions · broker history</h2><span class="muted">Includes trades placed outside the bot</span></div>
+  <div class="section-head"><h2>Closed bot positions</h2><span class="muted">Trades recorded by this bot</span></div>
     <div class="table-wrap"><table><thead><tr><th>Closed · ET</th><th>Position</th><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Exit</th><th>Net P&amp;L</th><th>Bot R</th></tr></thead><tbody id="closed-rows"><tr><td class="empty" colspan="9">Loading history…</td></tr></tbody></table></div>
   </section>
   <section>
@@ -195,10 +195,10 @@ async def dashboard_home():
 
 @router.get("/api/live")
 async def api_live_account():
-    """Return current account state and all open broker positions."""
+    """Return current account state and open positions placed by this bot."""
     try:
         account = await ctrader_client.get_account_info()
-        positions = await ctrader_client.get_open_positions()
+        positions = await ctrader_client.get_bot_positions()
         pnl_by_position = await ctrader_client.get_unrealized_pnl()
         serialized = []
         for position in positions:
@@ -245,16 +245,19 @@ async def api_live_account():
 
 @router.get("/api/history")
 async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
-    """Return closed broker deals aggregated into positions and bot statistics."""
+    """Return closed bot deals aggregated into positions and bot statistics."""
     now = datetime.now(UTC)
     start = now - timedelta(days=days)
     try:
         deals = await ctrader_client.get_deals(start, now)
         bot_rows = risk_manager.get_trade_history(limit=1000)
         bot_trades = {str(row["trade_id"]): row for _, row in bot_rows.iterrows()}
+        bot_position_ids = {int(trade_id) for trade_id in bot_trades}
 
         grouped: dict[int, dict] = {}
         for deal in deals:
+            if int(deal.position_id) not in bot_position_ids:
+                continue
             detail = deal.close_detail
             if detail is None:
                 continue
@@ -316,9 +319,7 @@ async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
 
         closed_positions.sort(key=lambda item: item["closed_at"], reverse=True)
         stats = risk_manager.get_r_multiple_stats(days)
-        stats["realized_pnl"] = sum(
-            float(row["pnl"] or 0) for row in bot_rows.itertuples()
-        )
+        stats["realized_pnl"] = float(bot_rows["pnl"].fillna(0).sum())
         return {
             "days": days,
             "realized_pnl": realized_pnl,

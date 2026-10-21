@@ -19,6 +19,7 @@ from src.risk_manager import RiskManager, Trade
 from src.scanner import MarketScanner
 from src.strategy_engine import StrategyEngine
 from src.technical_analysis import TechnicalAnalyzer
+from src.trading_cycle import TradingCycle
 
 
 class SpotQuoteTests(IsolatedAsyncioTestCase):
@@ -260,13 +261,14 @@ class DashboardTests(IsolatedAsyncioTestCase):
     async def test_dashboard_renders_live_positions_and_history_sections(self) -> None:
         page = await dashboard_home()
 
-        self.assertIn("Open positions · live from cTrader", page)
-        self.assertIn("Closed positions · broker history", page)
+        self.assertIn("Open bot positions · live from cTrader", page)
+        self.assertIn("Closed bot positions", page)
+        self.assertNotIn("Includes trades placed outside the bot", page)
         self.assertIn("/dashboard/api/live", page)
         self.assertIn("/dashboard/api/history", page)
 
-    async def test_live_dashboard_uses_broker_pnl_for_equity(self) -> None:
-        position = SimpleNamespace(
+    async def test_live_dashboard_only_includes_bot_positions(self) -> None:
+        bot_position = SimpleNamespace(
             position_id=12,
             symbol_id=1,
             side=SimpleNamespace(value="BUY"),
@@ -274,6 +276,15 @@ class DashboardTests(IsolatedAsyncioTestCase):
             entry_price=Decimal("1.10000"),
             stop_loss=Decimal("1.09000"),
             take_profit=Decimal("1.12000"),
+        )
+        manual_position = SimpleNamespace(
+            position_id=13,
+            symbol_id=1,
+            side=SimpleNamespace(value="SELL"),
+            volume=200,
+            entry_price=Decimal("1.11000"),
+            stop_loss=None,
+            take_profit=None,
         )
         symbol_info = SimpleNamespace(
             volume_to_lots=lambda volume: Decimal(volume) / Decimal(100)
@@ -284,9 +295,13 @@ class DashboardTests(IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=SimpleNamespace(balance=Decimal(1000))),
             ),
             patch(
-                "dashboard.multiple_tracker.ctrader_client.get_open_positions",
-                new=AsyncMock(return_value=[position]),
+                "dashboard.multiple_tracker.ctrader_client.get_bot_positions",
+                new=AsyncMock(return_value=[bot_position]),
             ),
+            patch(
+                "dashboard.multiple_tracker.ctrader_client.get_open_positions",
+                new=AsyncMock(return_value=[bot_position, manual_position]),
+            ) as get_open_positions,
             patch(
                 "dashboard.multiple_tracker.ctrader_client.get_unrealized_pnl",
                 new=AsyncMock(return_value={12: 25.0}),
@@ -305,11 +320,14 @@ class DashboardTests(IsolatedAsyncioTestCase):
         self.assertEqual(response["balance"], 1000.0)
         self.assertEqual(response["unrealized_pnl"], 25.0)
         self.assertEqual(response["equity"], 1025.0)
+        self.assertEqual(len(response["positions"]), 1)
+        self.assertEqual(response["positions"][0]["position_id"], 12)
         self.assertEqual(response["positions"][0]["lots"], 1.0)
+        get_open_positions.assert_not_awaited()
 
-    async def test_history_dashboard_aggregates_broker_closed_deals(self) -> None:
+    async def test_history_dashboard_only_aggregates_bot_closed_deals(self) -> None:
         closed_at = datetime.now(UTC)
-        deal = SimpleNamespace(
+        bot_deal = SimpleNamespace(
             close_detail=SimpleNamespace(
                 closed_volume=100,
                 entry_price=Decimal("1.10000"),
@@ -324,13 +342,28 @@ class DashboardTests(IsolatedAsyncioTestCase):
             execution_price=Decimal("1.10200"),
             execution_timestamp=closed_at,
         )
+        manual_deal = SimpleNamespace(
+            close_detail=SimpleNamespace(
+                closed_volume=200,
+                entry_price=Decimal("1.11000"),
+                gross_profit=Decimal(50),
+                swap=Decimal(0),
+                commission=Decimal(0),
+                pnl_conversion_fee=Decimal(0),
+            ),
+            position_id=13,
+            symbol_id=1,
+            side=SimpleNamespace(value="BUY"),
+            execution_price=Decimal("1.10800"),
+            execution_timestamp=closed_at,
+        )
         symbol_info = SimpleNamespace(
             volume_to_lots=lambda volume: Decimal(volume) / Decimal(100)
         )
         with (
             patch(
                 "dashboard.multiple_tracker.ctrader_client.get_deals",
-                new=AsyncMock(return_value=[deal]),
+                new=AsyncMock(return_value=[bot_deal, manual_deal]),
             ),
             patch(
                 "dashboard.multiple_tracker.ctrader_client.symbol_name",
@@ -342,7 +375,9 @@ class DashboardTests(IsolatedAsyncioTestCase):
             ),
             patch(
                 "dashboard.multiple_tracker.risk_manager.get_trade_history",
-                return_value=pd.DataFrame(columns=["trade_id", "pnl", "r_multiple"]),
+                return_value=pd.DataFrame(
+                    [{"trade_id": "12", "pnl": 17.0, "r_multiple": 1.0}]
+                ),
             ),
             patch(
                 "dashboard.multiple_tracker.risk_manager.get_r_multiple_stats",
@@ -352,5 +387,92 @@ class DashboardTests(IsolatedAsyncioTestCase):
             response = await api_trade_history(days=30)
 
         self.assertEqual(response["realized_pnl"], 17.0)
+        self.assertEqual(len(response["closed_positions"]), 1)
+        self.assertEqual(response["closed_positions"][0]["position_id"], 12)
         self.assertEqual(response["closed_positions"][0]["side"], "buy")
         self.assertEqual(response["closed_positions"][0]["pnl"], 17.0)
+
+
+class TradingCycleNotificationTests(IsolatedAsyncioTestCase):
+    async def test_market_close_flattens_then_sends_daily_summary(self) -> None:
+        cycle = TradingCycle()
+        with (
+            patch("src.trading_cycle.market_hours.is_close_time", return_value=True),
+            patch.object(cycle, "_reconcile_exits", new=AsyncMock()) as reconcile,
+            patch.object(cycle, "_close_all_positions", new=AsyncMock()) as close_all,
+            patch.object(cycle, "send_daily_summary", new=AsyncMock()) as summary,
+        ):
+            await cycle._tick()
+
+        reconcile.assert_awaited_once()
+        close_all.assert_awaited_once_with("market_close")
+        summary.assert_awaited_once()
+
+    async def test_reconciled_bot_exit_sends_close_notification(self) -> None:
+        cycle = TradingCycle()
+        trade = {
+            "instrument": "EURUSD",
+            "direction": "long",
+            "entry_price": 1.1,
+            "stop_loss": 1.09,
+            "take_profit": 1.13,
+        }
+        with (
+            patch("src.trading_cycle.risk_manager.get_trade", return_value=trade),
+            patch(
+                "src.trading_cycle.ctrader_client.get_closed_position_summary",
+                new=AsyncMock(return_value=(1.12, 20.0)),
+            ),
+            patch(
+                "src.trading_cycle.risk_manager.record_exit", return_value=2.0
+            ) as record_exit,
+            patch(
+                "src.trading_cycle.telegram.send_message_async", new=AsyncMock()
+            ) as send_message,
+        ):
+            await cycle._record_exit(12, "take_profit")
+
+        record_exit.assert_called_once_with(12, 1.12, 20.0, "take_profit")
+        send_message.assert_awaited_once()
+        self.assertIn("CLOSED EURUSD #12 LONG", send_message.await_args.args[0])
+        self.assertIn("P&amp;L=+20.00", send_message.await_args.args[0])
+
+    async def test_daily_summary_uses_today_and_is_only_sent_once(self) -> None:
+        cycle = TradingCycle()
+        trades = [
+            {"pnl": 20.0, "r_multiple": 2.0},
+            {"pnl": -10.0, "r_multiple": -1.0},
+        ]
+        with (
+            patch(
+                "src.trading_cycle.market_hours.now_est",
+                return_value=datetime(2026, 10, 21, 15, 30, tzinfo=UTC),
+            ),
+            patch(
+                "src.trading_cycle.risk_manager.daily_summary_exists",
+                side_effect=[False, True],
+            ),
+            patch(
+                "src.trading_cycle.ctrader_client.get_account_info",
+                new=AsyncMock(return_value=SimpleNamespace(balance=1000)),
+            ),
+            patch(
+                "src.trading_cycle.risk_manager.get_today_closed_trades",
+                return_value=trades,
+            ),
+            patch("src.trading_cycle.risk_manager.save_daily_summary") as save,
+            patch(
+                "src.trading_cycle.telegram.send_daily_summary_async",
+                new=AsyncMock(),
+            ) as send_summary,
+        ):
+            await cycle.send_daily_summary()
+            await cycle.send_daily_summary()
+
+        save.assert_called_once()
+        send_summary.assert_awaited_once()
+        summary = send_summary.await_args.args[0]
+        self.assertIn("2026-10-21 ET", summary)
+        self.assertIn("Closed bot trades: 2", summary)
+        self.assertIn("Realized P&amp;L: +10.00", summary)
+        self.assertIn("Net R: +1.00", summary)

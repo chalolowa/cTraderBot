@@ -350,6 +350,58 @@ class TechnicalAnalyzer:
         return {"matched": all(ok for _, ok, _ in checks), "checks": checks}
 
     @classmethod
+    def reversal_votes(
+            cls,
+            df: pd.DataFrame,
+            is_long: bool,
+            body_atr: float = 1.0,
+            fast: int = 9,
+            atr_period: int = 14,
+            rsi_period: int = 14,
+    ) -> dict[str, Any]:
+        """
+        Count independent signs that the latest CLOSED candle turned against an open trade:
+          ma     - closed back through the fast SMA against the trade
+          rsi    - RSI crossed to the wrong side of 50
+          candle - opposite candle with a body of at least `body_atr` x ATR
+        """
+        cols = [f"SMA_{fast}", f"ATR_{atr_period}", f"RSI_{rsi_period}"]
+        if df is None or df.empty or any(c not in df.columns for c in cols):
+            return {"votes": 0, "detail": {}}
+        last = df.iloc[-1]
+        sma, atr, rsi = float(last[f"SMA_{fast}"]), float(last[f"ATR_{atr_period}"]), float(last[f"RSI_{rsi_period}"])
+        if any(pd.isna(v) for v in (sma, atr, rsi)) or atr <= 0:
+            return {"votes": 0, "detail": {}}
+        body = float(last["close"]) - float(last["open"])
+        if is_long:
+            detail = {"ma": float(last["close"]) < sma, "rsi": rsi < 50, "candle": -body >= body_atr * atr}
+        else:
+            detail = {"ma": float(last["close"]) > sma, "rsi": rsi > 50, "candle": body >= body_atr * atr}
+        return {"votes": sum(detail.values()), "detail": detail}
+
+    @classmethod
+    def momentum_fading(
+            cls,
+            df: pd.DataFrame,
+            is_long: bool,
+            bars: int = 3,
+            max_progress_atr: float = 0.5,
+            adx_period: int = 14,
+            atr_period: int = 14,
+    ) -> bool:
+        """True when ADX is lower than `bars` candles ago AND price made little progress with the trade."""
+        adx_col, atr_col = f"ADX_{adx_period}", f"ATR_{atr_period}"
+        if df is None or len(df) < bars + 2 or adx_col not in df.columns or atr_col not in df.columns:
+            return False
+        adx_now, adx_then = df[adx_col].iloc[-1], df[adx_col].iloc[-1 - bars]
+        atr = df[atr_col].iloc[-1]
+        if any(pd.isna(v) for v in (adx_now, adx_then, atr)) or float(atr) <= 0:
+            return False
+        sign = 1.0 if is_long else -1.0
+        progress = sign * (float(df["close"].iloc[-1]) - float(df["close"].iloc[-1 - bars])) / float(atr)
+        return bool(float(adx_now) < float(adx_then) and progress <= max_progress_atr)
+
+    @classmethod
     def get_latest_signal(cls, df: pd.DataFrame) -> dict[str, Any]:
         """Extract latest indicator values and signal states."""
         if df.empty:

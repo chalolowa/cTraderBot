@@ -107,7 +107,7 @@ class RiskManager:
             # stays the INITIAL stop so R-multiples remain comparable; `current_stop`
             # is the trailed stop, `peak_r` the best open profit reached (MFE).
             existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
-            for column in ("current_stop", "peak_r", "peak_price"):
+            for column in ("current_stop", "current_tp", "peak_r", "peak_price"):
                 if column not in existing:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {column} REAL")
 
@@ -405,6 +405,14 @@ class RiskManager:
                 ),
             )
 
+    def daily_summary_exists(self, day: str) -> bool:
+        """Return whether an end-of-day summary has already been recorded."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM daily_summary WHERE date = ?", (day,)
+            ).fetchone()
+        return row is not None
+
     def get_closed_trades(self, days: int = 30) -> list[Trade]:
         with self._connection() as conn:
             rows = conn.execute(
@@ -515,6 +523,7 @@ class RiskManager:
         peak_r: float | None = None,
         peak_price: float | None = None,
         take_profit: float | None = None,
+        current_tp: float | None = None,
     ) -> None:
         """Persist trailed stop / best profit reached for an open trade."""
         fields, params = [], []
@@ -523,6 +532,7 @@ class RiskManager:
             ("peak_r", peak_r),
             ("peak_price", peak_price),
             ("take_profit", take_profit),
+            ("current_tp", current_tp),
         ):
             if value is not None:
                 fields.append(f"{name} = ?")
@@ -565,12 +575,15 @@ class RiskManager:
                 "AND entry_time >= ? AND entry_time < ? ORDER BY entry_time",
                 (symbol, start.isoformat(), end.isoformat()),
             ).fetchall()
+            last_closed = conn.execute(
+                "SELECT * FROM trades WHERE instrument = ? AND status = 'closed' "
+                "AND exit_time >= ? AND exit_time < ? ORDER BY exit_time DESC LIMIT 1",
+                (symbol, start.isoformat(), end.isoformat()),
+            ).fetchone()
         trades = [dict(row) for row in rows]
-        closed = [t for t in trades if t.get("status") == "closed"]
-        closed.sort(key=lambda t: t.get("exit_time") or "")
         return {
             "count": len(trades),
-            "last_closed": closed[-1] if closed else None,
+            "last_closed": dict(last_closed) if last_closed else None,
             "last_entry_time": self._parse_ts(trades[-1]["entry_time"]) if trades else None,
         }
 
