@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
-from config.ctrader_client import ctrader_client
+from config.ctrader_client import BOT_LABEL, ctrader_client
 from config.settings import settings
 from src.risk_manager import risk_manager
 from src.strategy_engine import strategy_engine
@@ -245,26 +245,32 @@ async def api_live_account():
 
 @router.get("/api/history")
 async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
-    """Return closed bot deals aggregated into positions and bot statistics."""
+    """Return closed positions identified by the bot order label or its journal."""
     now = datetime.now(UTC)
     start = now - timedelta(days=days)
     try:
+        orders = await ctrader_client.get_orders(start, now)
+        journal_trades = risk_manager.get_closed_trades(days)
+        journal_by_id = {int(trade.trade_id): trade for trade in journal_trades}
+        bot_position_ids = {
+            int(order.position_id)
+            for order in orders
+            if order.position_id is not None and order.label == BOT_LABEL
+        }
+        bot_position_ids.update(journal_by_id)
         deals = await ctrader_client.get_deals(start, now)
-        bot_rows = risk_manager.get_trade_history(limit=1000)
-        bot_trades = {str(row["trade_id"]): row for _, row in bot_rows.iterrows()}
-        bot_position_ids = {int(trade_id) for trade_id in bot_trades}
 
+        today = datetime.now(EASTERN).date()
+        closed_positions = []
         grouped: dict[int, dict] = {}
         for deal in deals:
-            if int(deal.position_id) not in bot_position_ids:
-                continue
+            position_id = int(deal.position_id)
             detail = deal.close_detail
-            if detail is None:
+            if position_id not in bot_position_ids or detail is None:
                 continue
             trade = grouped.setdefault(
-                deal.position_id,
+                position_id,
                 {
-                    "position_id": deal.position_id,
                     "symbol_id": deal.symbol_id,
                     "side": "sell" if deal.side.value.lower() == "buy" else "buy",
                     "closed_volume": 0,
@@ -274,10 +280,10 @@ async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
                     "closed_at": deal.execution_timestamp,
                 },
             )
-            closed_volume = detail.closed_volume
-            trade["closed_volume"] += closed_volume
-            trade["entry_value"] += float(detail.entry_price) * closed_volume
-            trade["exit_value"] += float(deal.execution_price) * closed_volume
+            volume = detail.closed_volume
+            trade["closed_volume"] += volume
+            trade["entry_value"] += float(detail.entry_price) * volume
+            trade["exit_value"] += float(deal.execution_price) * volume
             trade["pnl"] += float(
                 detail.gross_profit
                 + detail.swap
@@ -286,40 +292,68 @@ async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
             )
             trade["closed_at"] = max(trade["closed_at"], deal.execution_timestamp)
 
-        closed_positions = []
-        today = datetime.now(EASTERN).date()
-        realized_pnl = 0.0
         today_realized_pnl = 0.0
         for position_id, trade in grouped.items():
-            symbol = ctrader_client.symbol_name(trade["symbol_id"])
-            symbol_info = await ctrader_client.get_symbol_info(symbol)
             volume = trade["closed_volume"]
-            pnl = trade["pnl"]
-            realized_pnl += pnl
-            if trade["closed_at"].astimezone(EASTERN).date() == today:
+            pnl = float(trade["pnl"])
+            closed_at = trade["closed_at"]
+            if closed_at.astimezone(EASTERN).date() == today:
                 today_realized_pnl += pnl
-            bot_trade = bot_trades.get(str(position_id))
+            journal_trade = journal_by_id.get(position_id)
             closed_positions.append(
                 {
                     "position_id": position_id,
-                    "symbol": symbol,
+                    "symbol": ctrader_client.symbol_name(trade["symbol_id"]),
                     "side": trade["side"],
-                    "lots": float(symbol_info.volume_to_lots(volume)),
+                    "lots": 0.0,
                     "entry_price": trade["entry_value"] / volume if volume else 0.0,
                     "exit_price": trade["exit_value"] / volume if volume else 0.0,
                     "pnl": pnl,
-                    "closed_at": trade["closed_at"].isoformat(),
+                    "closed_at": closed_at.isoformat(),
                     "r_multiple": (
-                        float(bot_trade["r_multiple"])
-                        if bot_trade is not None
-                        else None
+                        float(journal_trade.r_multiple) if journal_trade else None
                     ),
+                }
+            )
+            symbol_info = await ctrader_client.get_symbol_info(
+                closed_positions[-1]["symbol"]
+            )
+            closed_positions[-1]["lots"] = float(
+                symbol_info.volume_to_lots(volume)
+            )
+
+        broker_position_ids = set(grouped)
+        for trade in journal_trades:
+            if trade.trade_id in broker_position_ids or trade.exit_time is None:
+                continue
+            closed_at = trade.exit_time
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=UTC)
+            pnl = float(trade.pnl)
+            if closed_at.astimezone(EASTERN).date() == today:
+                today_realized_pnl += pnl
+            closed_positions.append(
+                {
+                    "position_id": trade.trade_id,
+                    "symbol": trade.instrument,
+                    "side": (
+                        "buy"
+                        if trade.direction.lower() in {"long", "buy"}
+                        else "sell"
+                    ),
+                    "lots": float(trade.position_size),
+                    "entry_price": float(trade.entry_price),
+                    "exit_price": float(trade.exit_price or 0.0),
+                    "pnl": pnl,
+                    "closed_at": closed_at.isoformat(),
+                    "r_multiple": float(trade.r_multiple),
                 }
             )
 
         closed_positions.sort(key=lambda item: item["closed_at"], reverse=True)
         stats = risk_manager.get_r_multiple_stats(days)
-        stats["realized_pnl"] = float(bot_rows["pnl"].fillna(0).sum())
+        realized_pnl = sum(float(position["pnl"]) for position in closed_positions)
+        stats["realized_pnl"] = realized_pnl
         return {
             "days": days,
             "realized_pnl": realized_pnl,

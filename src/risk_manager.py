@@ -104,12 +104,24 @@ class RiskManager:
             """)
 
             # Trade-management columns (added after the first release). `stop_loss`
-            # stays the INITIAL stop so R-multiples remain comparable; `current_stop`
-            # is the trailed stop, `peak_r` the best open profit reached (MFE).
+            # Keep intended software levels separate from levels confirmed by cTrader
+            # so rejected broker amendments can be retried on the next management pass.
             existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
-            for column in ("current_stop", "current_tp", "peak_r", "peak_price"):
+            for column in (
+                "current_stop",
+                "current_tp",
+                "broker_stop",
+                "broker_tp",
+                "peak_r",
+                "peak_price",
+            ):
                 if column not in existing:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {column} REAL")
+            for column in ("telegram_open_notified", "telegram_close_notified"):
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE trades ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS daily_summary (
@@ -123,6 +135,14 @@ class RiskManager:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            summary_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(daily_summary)")
+            }
+            if "telegram_notified" not in summary_columns:
+                conn.execute(
+                    "ALTER TABLE daily_summary ADD COLUMN "
+                    "telegram_notified INTEGER NOT NULL DEFAULT 0"
+                )
 
     def record_entry(self, trade: Trade):
         """Record trade entry and outbox event atomically in a single SQLite transaction."""
@@ -137,8 +157,9 @@ class RiskManager:
                     """
                     INSERT OR REPLACE INTO trades
                     (trade_id, instrument, direction, entry_price, stop_loss, take_profit,
-                     position_size, entry_time, status, r_multiple)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     position_size, entry_time, status, r_multiple, current_stop,
+                     current_tp, broker_stop, broker_tp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         str(trade.trade_id),
@@ -151,6 +172,10 @@ class RiskManager:
                         entry_iso,
                         trade.status,
                         0.0,
+                        trade.stop_loss,
+                        trade.take_profit,
+                        trade.stop_loss,
+                        trade.take_profit,
                     ),
                 )
 
@@ -406,21 +431,31 @@ class RiskManager:
             )
 
     def daily_summary_exists(self, day: str) -> bool:
-        """Return whether an end-of-day summary has already been recorded."""
+        """Return whether the end-of-day Telegram summary was delivered."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT 1 FROM daily_summary WHERE date = ?", (day,)
+                "SELECT 1 FROM daily_summary WHERE date = ? "
+                "AND telegram_notified = 1",
+                (day,),
             ).fetchone()
         return row is not None
 
+    def mark_daily_summary_notified(self, day: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE daily_summary SET telegram_notified = 1 WHERE date = ?",
+                (day,),
+            )
+
     def get_closed_trades(self, days: int = 30) -> list[Trade]:
+        cutoff = (datetime.now(UTC) - timedelta(days=int(days))).isoformat()
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT trade_id, instrument, direction, entry_price, exit_price, stop_loss, "
                 "take_profit, position_size, entry_time, exit_time, pnl, status, r_multiple, exit_reason "
                 "FROM trades WHERE status = 'closed' "
-                "AND exit_time >= datetime('now', ?) ORDER BY exit_time",
-                (f"-{int(days)} days",),
+                "AND exit_time >= ? ORDER BY exit_time DESC",
+                (cutoff,),
             ).fetchall()
 
         trades = []
@@ -515,6 +550,39 @@ class RiskManager:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_pending_trade_notifications(
+        self, closed_days: int = 7
+    ) -> list[dict[str, Any]]:
+        """Get unnotified open trades and recent closed trades from the bot journal."""
+        closed_since = (datetime.now(UTC) - timedelta(days=closed_days)).isoformat()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM trades
+                WHERE (status = 'open' AND telegram_open_notified = 0)
+                   OR (status = 'closed' AND telegram_close_notified = 0
+                       AND exit_time >= ?)
+                ORDER BY COALESCE(exit_time, entry_time)
+                """,
+                (closed_since,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_trade_notification_sent(self, trade_id: int, event: str) -> None:
+        """Mark a Telegram trade alert delivered so it is not sent twice."""
+        columns = {
+            "open": "telegram_open_notified",
+            "close": "telegram_close_notified",
+        }
+        column = columns.get(event)
+        if column is None:
+            raise ValueError(f"Unsupported trade notification event: {event}")
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE trades SET {column} = 1 WHERE trade_id = ?",
+                (str(trade_id),),
+            )
+
     def update_trade_management(
         self,
         trade_id: int,
@@ -524,8 +592,10 @@ class RiskManager:
         peak_price: float | None = None,
         take_profit: float | None = None,
         current_tp: float | None = None,
+        broker_stop: float | None = None,
+        broker_tp: float | None = None,
     ) -> None:
-        """Persist trailed stop / best profit reached for an open trade."""
+        """Persist software levels and the last stop/target confirmed by cTrader."""
         fields, params = [], []
         for name, value in (
             ("current_stop", current_stop),
@@ -533,6 +603,8 @@ class RiskManager:
             ("peak_price", peak_price),
             ("take_profit", take_profit),
             ("current_tp", current_tp),
+            ("broker_stop", broker_stop),
+            ("broker_tp", broker_tp),
         ):
             if value is not None:
                 fields.append(f"{name} = ?")

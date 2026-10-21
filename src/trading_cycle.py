@@ -38,11 +38,13 @@ class TradingCycle:
         self._bar_cache: dict[str, dict[str, Any]] = {}
         self._ret_cache: dict[str, tuple[datetime, pd.Series]] = {}
         self._amend_warned = False
+        self._notification_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self.running = True
         _console("cTraderbot loop started", level=logging.INFO)
         await telegram.send_message_async("auto trading initiated....")
+        await self._deliver_pending_trade_notifications()
         mgmt_task = asyncio.create_task(self._management_loop())
         try:
             while self.running:
@@ -396,6 +398,7 @@ class TradingCycle:
                 entry_time=datetime.now(UTC),
             )
         )
+        await self._deliver_pending_trade_notifications()
 
         # A18 logging: Order placed successfully
         _console(
@@ -637,6 +640,7 @@ class TradingCycle:
         """Fast loop (seconds, not minutes) that protects open trades."""
         while self.running:
             try:
+                await self._deliver_pending_trade_notifications()
                 await self._manage_open_positions()
             except asyncio.CancelledError:
                 raise
@@ -751,6 +755,8 @@ class TradingCycle:
             return
         current_stop = float(trade.get("current_stop") or initial_stop)
         current_tp = float(trade.get("current_tp") or trade["take_profit"])
+        broker_stop = float(trade.get("broker_stop") or initial_stop)
+        broker_tp = float(trade.get("broker_tp") or trade["take_profit"])
 
         tick = ctrader_client.get_tick(symbol)
         price = float(tick.bid if is_long else tick.ask)  # the side we would exit on
@@ -908,9 +914,6 @@ class TradingCycle:
                 new_tp = candidate_tp
                 why.append("tp_compress")
 
-        if new_stop == current_stop and new_tp == current_tp:
-            return
-
         if (is_long and new_stop >= price) or (not is_long and new_stop <= price):
             # Price has already given back to the protective level: exit now.
             await self._close_managed(
@@ -922,28 +925,36 @@ class TradingCycle:
         step = float(cfg["min_stop_step_r"]) * risk
         stop_moved = abs(new_stop - current_stop) >= step
         tp_moved = abs(new_tp - current_tp) >= step
-        if not (stop_moved or tp_moved):
-            return
         use_stop = new_stop if stop_moved else current_stop
         use_tp = new_tp if tp_moved else current_tp
+        broker_update_pending = use_stop != broker_stop or use_tp != broker_tp
+        if not (stop_moved or tp_moved or broker_update_pending):
+            return
 
-        # Persist first: these levels are what the software enforcement above uses,
-        # whether or not the broker accepts the amend.
+        # Persist intended levels for software enforcement. Broker-confirmed values
+        # advance only after a successful amend so failures remain retryable.
         risk_manager.update_trade_management(
             position_id, current_stop=use_stop, current_tp=use_tp
         )
-        broker_note = "broker updated"
-        if abs(price - use_stop) < min_dist or abs(price - use_tp) < min_dist:
-            broker_note = "too close to price for broker, software level only"
-        else:
+        broker_note = "broker levels already match"
+        if broker_update_pending and (
+            abs(price - use_stop) < min_dist or abs(price - use_tp) < min_dist
+        ):
+            broker_note = "too close to price for broker; will retry"
+        elif broker_update_pending:
             try:
                 # amend replaces BOTH levels, so always send both.
                 await ctrader_client.amend_position_sltp(
                     position_id, stop_loss=use_stop, take_profit=use_tp
                 )
+                risk_manager.update_trade_management(
+                    position_id, broker_stop=use_stop, broker_tp=use_tp
+                )
+                broker_stop, broker_tp = use_stop, use_tp
+                broker_note = "broker updated"
             except Exception as exc:
                 broker_note = (
-                    f"BROKER AMEND FAILED ({exc!r}); bot enforces level in software"
+                    f"BROKER AMEND FAILED ({exc!r}); software enforces level and will retry"
                 )
                 _console(
                     f"Amend failed for {symbol} #{position_id}: {exc!r}",
@@ -952,8 +963,11 @@ class TradingCycle:
                 if not self._amend_warned:
                     self._amend_warned = True
                     await telegram.send_message_async(
-                        f"WARNING: stop/TP amend failed ({exc!r}). Trailing now runs in software only."
+                        f"WARNING: stop/TP amend failed ({exc!r}). "
+                        "Software protection remains active; broker amend will be retried."
                     )
+        if broker_update_pending and not why:
+            why.append("broker_retry")
         risk_manager.record_event(
             "trade_management",
             {
@@ -1002,18 +1016,66 @@ class TradingCycle:
                 )
 
     async def _record_exit(self, position_id: int, reason: str | None) -> None:
-        trade = risk_manager.get_trade(position_id)
         exit_price, pnl = await ctrader_client.get_closed_position_summary(position_id)
+        trade = risk_manager.get_trade(position_id)
         if reason is None:
             reason = self._infer_exit_reason(trade, float(exit_price))
-        r_multiple = risk_manager.record_exit(position_id, exit_price, pnl, reason)
+        risk_manager.record_exit(position_id, exit_price, pnl, reason)
         if trade is not None:
-            await telegram.send_message_async(
-                f"CLOSED {trade['instrument']} #{position_id} "
-                f"{str(trade['direction']).upper()} | {reason} | "
-                f"exit={float(exit_price):.5f} | P&amp;L={float(pnl):+.2f} | "
-                f"R={r_multiple:+.2f}"
-            )
+            await self._deliver_pending_trade_notifications()
+
+    async def _deliver_pending_trade_notifications(self) -> None:
+        """Send journal-backed alerts and retain failures for a later retry."""
+        async with self._notification_lock:
+            await self._deliver_pending_trade_notifications_locked()
+
+    async def _deliver_pending_trade_notifications_locked(self) -> None:
+        pending = risk_manager.get_pending_trade_notifications()
+        if not pending:
+            return
+
+        open_ids: set[int] = set()
+        if any(trade["status"] == "open" for trade in pending):
+            try:
+                open_ids = {
+                    int(position.position_id)
+                    for position in await ctrader_client.get_bot_positions()
+                }
+            except (CTraderError, RuntimeError, ValueError) as exc:
+                _console(
+                    f"Cannot verify open bot positions for Telegram alerts: {exc}",
+                    level=logging.WARNING,
+                )
+                return
+
+        for trade in pending:
+            position_id = int(trade["trade_id"])
+            status = str(trade["status"])
+            if status == "open":
+                if position_id not in open_ids:
+                    continue
+                message = (
+                    f"OPEN {trade['instrument']} #{position_id} "
+                    f"{str(trade['direction']).upper()} | "
+                    f"entry={float(trade['entry_price']):.5f} | "
+                    f"size={float(trade['position_size']):g} lots | "
+                    f"SL={float(trade.get('current_stop') or trade['stop_loss']):.5f} | "
+                    f"TP={float(trade.get('current_tp') or trade['take_profit']):.5f}"
+                )
+                event = "open"
+            else:
+                message = (
+                    f"CLOSED {trade['instrument']} #{position_id} "
+                    f"{str(trade['direction']).upper()} | "
+                    f"{trade.get('exit_reason') or 'broker_exit'} | "
+                    f"exit={float(trade.get('exit_price') or 0.0):.5f} | "
+                    f"P&L={float(trade.get('pnl') or 0.0):+.2f} | "
+                    f"R={float(trade.get('r_multiple') or 0.0):+.2f}"
+                )
+                event = "close"
+
+            if await telegram.send_message_async(message):
+                risk_manager.mark_trade_notification_sent(position_id, event)
 
     @staticmethod
     def _infer_exit_reason(trade: dict[str, Any] | None, exit_price: float) -> str:
@@ -1091,16 +1153,17 @@ class TradingCycle:
             peak_r = max(peak_r, cumulative_r)
             max_drawdown = max(max_drawdown, peak_r - cumulative_r)
         summary_text = (
-            f"<b>Daily Summary · {summary_day} ET</b>\n"
+            f"Daily Summary · {summary_day} ET\n"
             f"Balance: {balance_text}\n"
             f"Closed bot trades: {len(trades)} (wins {wins}, losses {losses})\n"
-            f"Realized P&amp;L: {pnl:+.2f}\n"
+            f"Realized P&L: {pnl:+.2f}\n"
             f"Net R: {cumulative_r:+.2f} | Win rate: {win_rate:.1f}%\n"
             f"Max R drawdown: {max_drawdown:.2f}"
         )
         _console(summary_text, level=logging.INFO)
-        await telegram.send_daily_summary_async(summary_text)
         risk_manager.save_daily_summary()
+        if await telegram.send_daily_summary_async(summary_text):
+            risk_manager.mark_daily_summary_notified(summary_day)
 
     def stop(self) -> None:
         self.running = False

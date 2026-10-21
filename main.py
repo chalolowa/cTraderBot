@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     try:
         await ctrader_client.connect()
         await mongo_synchronizer.start()
+        await telegram.initialize()
         await telegram.send_message_async(
             f"cTraderBot started on {settings.API_HOST}:{settings.API_PORT}"
         )
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
         await mongo_synchronizer.stop()
         await ctrader_client.disconnect()
         await telegram.send_message_async("cTraderBot stopped.")
+        await telegram.shutdown()
 
 
 app = FastAPI(title="cTraderBot API", version="3.0.0", lifespan=lifespan)
@@ -353,7 +355,6 @@ async def close_trade(position_id: int):
                 f"Position {position_id} closed; exit journal will be reconciled: {exc}",
                 level=logging.WARNING,
             )
-        await telegram.send_message_async(f"Closed cTrader position {position_id}")
         return {
             "status": "success",
             "position_id": position_id,

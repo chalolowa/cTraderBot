@@ -78,6 +78,10 @@ _FILLED_TYPES = (
     ExecutionType.ORDER_PARTIAL_FILL,
     ExecutionType.ORDER_FILLED,
 )
+_AMEND_SUCCESS_TYPES = (
+    ExecutionType.ORDER_ACCEPTED,
+    ExecutionType.ORDER_REPLACED,
+)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -421,6 +425,14 @@ class CTraderBrokerClient:
             self._account_id, from_timestamp, to_timestamp
         )
 
+    async def get_orders(self, from_timestamp: datetime, to_timestamp: datetime):
+        """Return broker orders executed in the requested time range."""
+        return await self._client.trading.get_orders(
+            self._account_id,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+        )
+
     async def get_unrealized_pnl(self) -> dict[int, float]:
         """Return broker-reported unrealized PnL keyed by position ID."""
         positions = await self._client.trading.get_unrealized_pnl_per_position(
@@ -529,7 +541,18 @@ class CTraderBrokerClient:
             stop_loss=Decimal(str(stop_loss)) if stop_loss is not None else None,
             take_profit=Decimal(str(take_profit)) if take_profit is not None else None,
         )
-        await self._client.trading.amend_position(self._account_id, request)
+        execution = await self._client.trading.amend_position(
+            self._account_id, request
+        )
+        if execution.execution_type not in _AMEND_SUCCESS_TYPES:
+            raise RuntimeError(
+                f"cTrader SL/TP amendment rejected for position {position_id} "
+                f"({execution.execution_type.value}): {execution.error_code}"
+            )
+        _console(
+            f"cTrader: amended position_id={position_id} "
+            f"SL={stop_loss} TP={take_profit} type={execution.execution_type.value}"
+        )
 
     async def close_position(self, position_id: int) -> OrderResult:
         positions = await self.get_open_positions()
