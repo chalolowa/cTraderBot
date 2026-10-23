@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -96,6 +97,229 @@ class SpotQuoteTests(IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "ORDER_REJECTED.*INVALID_SL"):
             await client.amend_position_sltp(12, 1.101, 1.13)
+
+    async def test_historical_candle_requests_are_spaced(self) -> None:
+        client = object.__new__(CTraderBrokerClient)
+        client._account_id = 7
+        client._symbol_name_to_id = {"EURUSD": 1}
+        client._trendbar_request_lock = asyncio.Lock()
+        client._last_trendbar_request = None
+        request_times = []
+
+        async def get_trendbars(*_args):
+            request_times.append(asyncio.get_running_loop().time())
+            return []
+
+        client._client = SimpleNamespace(
+            market_data=SimpleNamespace(get_trendbars=AsyncMock(side_effect=get_trendbars))
+        )
+        await asyncio.gather(
+            client.copy_rates_from_pos("EURUSD", "M1", count=1),
+            client.copy_rates_from_pos("EURUSD", "M1", count=1),
+        )
+
+        self.assertGreaterEqual(request_times[1] - request_times[0], 0.49)
+
+    async def test_accepted_order_waits_for_server_fill_before_reporting_success(self) -> None:
+        client = object.__new__(CTraderBrokerClient)
+        client._account_id = 7
+        client._client = SimpleNamespace(
+            trading=SimpleNamespace(
+                place_order=AsyncMock(
+                    return_value=ExecutionEvent(
+                        account_id=7,
+                        execution_type=ExecutionType.ORDER_ACCEPTED,
+                        order_id=91,
+                        position_id=None,
+                        symbol_id=1,
+                        side=OrderSide.BUY,
+                        filled_volume=None,
+                        fill_price=None,
+                        timestamp=datetime.now(UTC),
+                    )
+                )
+            )
+        )
+        client._execution_waiters = {}
+        client._recent_fills = {}
+        fill = ExecutionEvent(
+            account_id=7,
+            execution_type=ExecutionType.ORDER_FILLED,
+            order_id=91,
+            position_id=92,
+            symbol_id=1,
+            side=OrderSide.BUY,
+            filled_volume=1000,
+            fill_price=Decimal("1.1001"),
+            timestamp=datetime.now(UTC),
+            is_server_event=True,
+        )
+        symbol_info = SimpleNamespace(
+            lots_to_volume=lambda _: 1000,
+            min_volume=100,
+            quantize_price=lambda price: price,
+        )
+        with (
+            patch.object(
+                client, "resolve_symbol_id", new=AsyncMock(return_value=1)
+            ),
+            patch.object(
+                client, "get_bot_positions", new=AsyncMock(return_value=[])
+            ),
+            patch.object(
+                client, "get_symbol_info", new=AsyncMock(return_value=symbol_info)
+            ),
+            patch.object(client, "_wait_for_fill", new=AsyncMock(return_value=fill)),
+        ):
+            result = await client.place_market_order(
+                "EURUSD", "long", 0.1, 1.09, 1.12
+            )
+
+        self.assertEqual(result.position_id, 92)
+        self.assertEqual(result.fill_price, 1.1001)
+        self.assertEqual(result.retcode, 0)
+
+    async def test_accepted_order_can_reconcile_new_position_when_fill_event_is_missing(self) -> None:
+        client = object.__new__(CTraderBrokerClient)
+        client._account_id = 7
+        client._client = SimpleNamespace(
+            trading=SimpleNamespace(
+                place_order=AsyncMock(
+                    return_value=ExecutionEvent(
+                        account_id=7,
+                        execution_type=ExecutionType.ORDER_ACCEPTED,
+                        order_id=91,
+                        position_id=None,
+                        symbol_id=1,
+                        side=OrderSide.BUY,
+                        filled_volume=None,
+                        fill_price=None,
+                        timestamp=datetime.now(UTC),
+                    )
+                )
+            )
+        )
+        client._execution_waiters = {}
+        client._recent_fills = {}
+        position = SimpleNamespace(
+            position_id=92,
+            symbol_id=1,
+            side=OrderSide.BUY,
+            entry_price=Decimal("1.1001"),
+        )
+        symbol_info = SimpleNamespace(
+            lots_to_volume=lambda _: 1000,
+            min_volume=100,
+            quantize_price=lambda price: price,
+        )
+        with (
+            patch.object(
+                client, "resolve_symbol_id", new=AsyncMock(return_value=1)
+            ),
+            patch.object(
+                client,
+                "get_bot_positions",
+                new=AsyncMock(side_effect=[[], [position]]),
+            ),
+            patch.object(
+                client, "get_symbol_info", new=AsyncMock(return_value=symbol_info)
+            ),
+            patch.object(
+                client, "_wait_for_fill", new=AsyncMock(return_value=None)
+            ),
+        ):
+            result = await client.place_market_order(
+                "EURUSD", "long", 0.1, 1.09, 1.12
+            )
+
+        self.assertEqual(result.position_id, 92)
+        self.assertAlmostEqual(result.fill_price, 1.1001)
+
+    async def test_modify_take_profit_pips_preserves_stop_loss(self) -> None:
+        client = object.__new__(CTraderBrokerClient)
+        position = SimpleNamespace(
+            position_id=12,
+            symbol_id=1,
+            side=OrderSide.BUY,
+            stop_loss=Decimal("1.09000"),
+            take_profit=None,
+        )
+        symbol_info = SimpleNamespace(
+            pip_position=4,
+            quantize_price=lambda price: price.quantize(Decimal("0.00001")),
+        )
+        with (
+            patch.object(
+                client,
+                "get_open_positions",
+                new=AsyncMock(return_value=[position]),
+            ),
+            patch.object(client, "symbol_name", return_value="EURUSD"),
+            patch.object(
+                client, "get_symbol_info", new=AsyncMock(return_value=symbol_info)
+            ),
+            patch.object(
+                client,
+                "get_tick",
+                return_value=SimpleNamespace(bid=Decimal("1.10000")),
+            ),
+            patch.object(
+                client, "amend_position_sltp", new=AsyncMock()
+            ) as amend,
+        ):
+            target = await client.modify_take_profit_pips(12, 10)
+
+        self.assertAlmostEqual(target, 1.101)
+        amend.assert_awaited_once_with(
+            12, stop_loss=1.09, take_profit=1.101
+        )
+
+    async def test_accepted_position_close_waits_for_fill(self) -> None:
+        client = object.__new__(CTraderBrokerClient)
+        client._account_id = 7
+        client._client = SimpleNamespace(
+            trading=SimpleNamespace(
+                close_position=AsyncMock(
+                    return_value=ExecutionEvent(
+                        account_id=7,
+                        execution_type=ExecutionType.ORDER_ACCEPTED,
+                        order_id=91,
+                        position_id=12,
+                        symbol_id=1,
+                        side=OrderSide.SELL,
+                        filled_volume=None,
+                        fill_price=None,
+                        timestamp=datetime.now(UTC),
+                    )
+                )
+            )
+        )
+        fill = ExecutionEvent(
+            account_id=7,
+            execution_type=ExecutionType.ORDER_FILLED,
+            order_id=91,
+            position_id=12,
+            symbol_id=1,
+            side=OrderSide.SELL,
+            filled_volume=1000,
+            fill_price=Decimal("1.101"),
+            timestamp=datetime.now(UTC),
+            is_server_event=True,
+        )
+        with (
+            patch.object(
+                client,
+                "get_open_positions",
+                new=AsyncMock(return_value=[SimpleNamespace(position_id=12, volume=1000)]),
+            ),
+            patch.object(
+                client, "_wait_for_fill", new=AsyncMock(return_value=fill)
+            ),
+        ):
+            result = await client.close_position(12)
+
+        self.assertEqual(result.retcode, 0)
+        self.assertEqual(result.fill_price, 1.101)
 
 
 class TelegramNotifierTests(IsolatedAsyncioTestCase):
@@ -326,6 +550,11 @@ class RiskManagerTests(TestCase):
 
 
 class DashboardTests(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        from dashboard.multiple_tracker import _response_cache
+
+        _response_cache.clear()
+
     async def test_dashboard_renders_live_positions_and_history_sections(self) -> None:
         page = await dashboard_home()
 
@@ -392,6 +621,27 @@ class DashboardTests(IsolatedAsyncioTestCase):
         self.assertEqual(response["positions"][0]["position_id"], 12)
         self.assertEqual(response["positions"][0]["lots"], 1.0)
         get_open_positions.assert_not_awaited()
+
+    async def test_live_dashboard_reuses_recent_broker_snapshot(self) -> None:
+        with (
+            patch(
+                "dashboard.multiple_tracker.ctrader_client.get_account_info",
+                new=AsyncMock(return_value=SimpleNamespace(balance=1000)),
+            ) as get_account,
+            patch(
+                "dashboard.multiple_tracker.ctrader_client.get_bot_positions",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "dashboard.multiple_tracker.ctrader_client.get_unrealized_pnl",
+                new=AsyncMock(return_value={}),
+            ),
+        ):
+            first = await api_live_account()
+            second = await api_live_account()
+
+        self.assertEqual(first, second)
+        get_account.assert_awaited_once()
 
     async def test_history_dashboard_includes_labeled_bot_deals_not_manual_deals(self) -> None:
         closed_at = datetime.now(UTC)
@@ -562,6 +812,47 @@ class TradingCycleNotificationTests(IsolatedAsyncioTestCase):
                 call(12, "open"),
             ],
         )
+
+    async def test_stalled_position_is_closed_after_configured_hold_limit(self) -> None:
+        cycle = TradingCycle()
+        trade = {
+            "trade_id": 12,
+            "instrument": "EURUSD",
+            "direction": "long",
+            "entry_price": 1.1,
+            "stop_loss": 1.09,
+            "take_profit": 1.13,
+            "current_stop": 1.09,
+            "current_tp": 1.13,
+            "peak_r": 0.2,
+            "entry_time": (datetime.now(UTC) - timedelta(minutes=61)).isoformat(),
+        }
+        cfg = {
+            "software_stops": True,
+            "late_day_close_minutes": 45,
+            "late_day_close_min_r": 0.5,
+            "stalled_trade_max_hold_minutes": 60,
+            "stalled_trade_min_progress_r": 0.5,
+        }
+        with (
+            patch(
+                "src.trading_cycle.ctrader_client.get_tick",
+                return_value=SimpleNamespace(bid=1.1005, ask=1.1006),
+            ),
+            patch(
+                "src.trading_cycle.risk_manager.update_trade_management"
+            ),
+            patch.object(
+                cycle, "_close_managed", new=AsyncMock()
+            ) as close_managed,
+        ):
+            await cycle._manage_one(trade, cfg, minutes_left=500)
+
+        close_managed.assert_awaited_once()
+        args = close_managed.await_args.args
+        self.assertEqual(args[:3], (12, "EURUSD", "time_stall"))
+        self.assertAlmostEqual(args[3], 0.05)
+        self.assertEqual(args[4], 0.2)
 
     async def test_broker_trailing_amendment_retries_until_confirmed(self) -> None:
         cycle = TradingCycle()

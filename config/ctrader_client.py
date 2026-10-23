@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from time import monotonic
 from typing import Any
 
 import pandas as pd
@@ -78,6 +80,7 @@ _FILLED_TYPES = (
     ExecutionType.ORDER_PARTIAL_FILL,
     ExecutionType.ORDER_FILLED,
 )
+_TRENDBAR_REQUEST_INTERVAL_SECONDS = 0.5
 _AMEND_SUCCESS_TYPES = (
     ExecutionType.ORDER_ACCEPTED,
     ExecutionType.ORDER_REPLACED,
@@ -130,6 +133,10 @@ class CTraderBrokerClient:
         self._symbol_id_to_name: dict[int, str] = {}
         self._symbol_cache: dict[int, Any] = {}
         self._last_spot: dict[int, _SpotQuote] = {}
+        self._trendbar_request_lock = asyncio.Lock()
+        self._last_trendbar_request: float | None = None
+        self._execution_waiters: dict[int, asyncio.Future[ExecutionEvent]] = {}
+        self._recent_fills: dict[int, ExecutionEvent] = {}
         self._token_store = SQLiteTokenStore(settings.DB_PATH)
 
     # ---- lifecycle ------------------------------------------------------
@@ -189,6 +196,10 @@ class CTraderBrokerClient:
         @client.on(SpotEvent)
         async def _on_spot(event: SpotEvent) -> None:
             self._cache_spot_event(event)
+
+        @client.on(ExecutionEvent)
+        async def _on_execution(event: ExecutionEvent) -> None:
+            await self._handle_execution_event(event)
 
         @client.on(ReadyEvent)
         async def _on_ready(event: ReadyEvent) -> None:
@@ -257,6 +268,20 @@ class CTraderBrokerClient:
             bid_timestamp=bid_timestamp,
             ask_timestamp=ask_timestamp,
         )
+
+    async def _handle_execution_event(self, event: ExecutionEvent) -> None:
+        if (
+            not event.is_server_event
+            or event.order_id <= 0
+            or event.execution_type not in _FILLED_TYPES
+        ):
+            return
+        self._recent_fills[event.order_id] = event
+        while len(self._recent_fills) > 100:
+            self._recent_fills.pop(next(iter(self._recent_fills)))
+        waiter = self._execution_waiters.get(event.order_id)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(event)
 
     async def disconnect(self) -> None:
         if self._client is None:
@@ -353,9 +378,17 @@ class CTraderBrokerClient:
         )  # padded for weekends/holidays
         to_ts = datetime.now(UTC)
         from_ts = to_ts - span
-        bars = await self._client.market_data.get_trendbars(
-            self._account_id, symbol_id, period, from_ts, to_ts
-        )
+        async with self._trendbar_request_lock:
+            if self._last_trendbar_request is not None:
+                wait = _TRENDBAR_REQUEST_INTERVAL_SECONDS - (
+                    monotonic() - self._last_trendbar_request
+                )
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._last_trendbar_request = monotonic()
+            bars = await self._client.market_data.get_trendbars(
+                self._account_id, symbol_id, period, from_ts, to_ts
+            )
         if not bars:
             return pd.DataFrame()
         if start_pos:
@@ -517,21 +550,73 @@ class CTraderBrokerClient:
             f"cTrader: placing order symbol={symbol} side={request.side.value} "
             f"volume={volume} ({lots} lots) sl={stop_loss} tp={take_profit}"
         )
+        existing_position_ids = {
+            int(position.position_id) for position in await self.get_bot_positions()
+        }
         execution = await self._client.trading.place_order(self._account_id, request)
-        ok = execution.execution_type in _FILLED_TYPES
-        if not ok:
+        if execution.execution_type in _FILLED_TYPES:
+            filled = execution
+        elif execution.execution_type == ExecutionType.ORDER_ACCEPTED:
+            filled = await self._wait_for_fill(execution.order_id)
+            if filled is None:
+                positions = await self.get_bot_positions()
+                if execution.position_id is not None:
+                    candidates = [
+                        position
+                        for position in positions
+                        if position.position_id == execution.position_id
+                    ]
+                else:
+                    candidates = [
+                        position
+                        for position in positions
+                        if int(position.position_id) not in existing_position_ids
+                        and position.symbol_id == symbol_id
+                        and position.side == request.side
+                    ]
+                if len(candidates) == 1:
+                    position = candidates[0]
+                    result = OrderResult(execution, True)
+                    result.position_id = int(position.position_id)
+                    result.fill_price = float(position.entry_price)
+                    return result
+            if filled is None:
+                raise RuntimeError(
+                    f"cTrader accepted market order {execution.order_id}, "
+                    "but no fill confirmation arrived; verify the broker account "
+                    "before retrying"
+                )
+        else:
             _console(
-                f"cTrader: order REJECTED symbol={symbol} type={execution.execution_type.value} "
+                f"cTrader: order failed symbol={symbol} type={execution.execution_type.value} "
                 f"error={execution.error_code}"
             )
             raise RuntimeError(
                 f"cTrader order rejected ({execution.execution_type.value}): {execution.error_code}"
             )
         _console(
-            f"cTrader: order result order_id={execution.order_id} position_id={execution.position_id} "
-            f"fill_price={execution.fill_price} type={execution.execution_type.value}"
+            f"cTrader: order result order_id={filled.order_id} position_id={filled.position_id} "
+            f"fill_price={filled.fill_price} type={filled.execution_type.value}"
         )
-        return OrderResult(execution, ok)
+        return OrderResult(filled, True)
+
+    async def _wait_for_fill(
+        self, order_id: int, timeout: float = 10.0
+    ) -> ExecutionEvent | None:
+        """Wait for cTrader's server-pushed fill after an ORDER_ACCEPTED reply."""
+        if order_id <= 0:
+            return None
+        recent = self._recent_fills.pop(order_id, None)
+        if recent is not None:
+            return recent
+        waiter = asyncio.get_running_loop().create_future()
+        self._execution_waiters[order_id] = waiter
+        try:
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            return None
+        finally:
+            self._execution_waiters.pop(order_id, None)
 
     async def amend_position_sltp(
         self, position_id: int, stop_loss: float | None, take_profit: float | None
@@ -554,6 +639,49 @@ class CTraderBrokerClient:
             f"SL={stop_loss} TP={take_profit} type={execution.execution_type.value}"
         )
 
+    async def modify_take_profit_pips(
+        self,
+        position_id: int,
+        pips: float,
+        *,
+        stop_loss: float | None = None,
+    ) -> float:
+        """Move a position's take profit by a pip distance from its current quote."""
+        if not math.isfinite(pips) or pips <= 0:
+            raise ValueError("Take-profit distance must be a positive finite pip value")
+        positions = await self.get_open_positions()
+        position = next(
+            (p for p in positions if p.position_id == int(position_id)), None
+        )
+        if position is None:
+            raise ValueError(f"cTrader: open position not found: {position_id}")
+
+        symbol = self.symbol_name(position.symbol_id)
+        symbol_info = await self.get_symbol_info(symbol)
+        is_long = position.side == OrderSide.BUY
+        sign = 1 if is_long else -1
+        tick = self.get_tick(symbol)
+        exit_quote = float(tick.bid if is_long else tick.ask)
+        target = exit_quote + sign * pips / (10**symbol_info.pip_position)
+        if position.take_profit is not None:
+            current_tp = float(position.take_profit)
+            target = min(target, current_tp) if is_long else max(target, current_tp)
+        target_price = float(symbol_info.quantize_price(Decimal(str(target))))
+        await self.amend_position_sltp(
+            position_id,
+            stop_loss=(
+                stop_loss
+                if stop_loss is not None
+                else (
+                    float(position.stop_loss)
+                    if position.stop_loss is not None
+                    else None
+                )
+            ),
+            take_profit=target_price,
+        )
+        return target_price
+
     async def close_position(self, position_id: int) -> OrderResult:
         positions = await self.get_open_positions()
         match = next((p for p in positions if p.position_id == int(position_id)), None)
@@ -563,16 +691,29 @@ class CTraderBrokerClient:
             position_id=match.position_id, volume=match.volume
         )
         execution = await self._client.trading.close_position(self._account_id, request)
-        ok = execution.execution_type in _FILLED_TYPES
+        filled = execution
+        if execution.execution_type == ExecutionType.ORDER_ACCEPTED:
+            filled = await self._wait_for_fill(execution.order_id)
+            if filled is None:
+                remaining = await self.get_open_positions()
+                if any(p.position_id == int(position_id) for p in remaining):
+                    raise RuntimeError(
+                        f"cTrader accepted close for position {position_id}, "
+                        "but the position remains open and no fill confirmation arrived"
+                    )
+                filled = execution
+        ok = filled.execution_type in _FILLED_TYPES or (
+            execution.execution_type == ExecutionType.ORDER_ACCEPTED
+        )
         _console(
-            f"cTrader: close position_id={position_id} type={execution.execution_type.value} "
-            f"fill_price={execution.fill_price}"
+            f"cTrader: close position_id={position_id} type={filled.execution_type.value} "
+            f"fill_price={filled.fill_price}"
         )
         if not ok:
             raise RuntimeError(
                 f"cTrader close rejected ({execution.execution_type.value}): {execution.error_code}"
             )
-        return OrderResult(execution, ok)
+        return OrderResult(filled, ok)
 
 
 ctrader_client = CTraderBrokerClient()

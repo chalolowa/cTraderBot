@@ -1,7 +1,10 @@
 """Live account and trade-performance dashboard routes."""
 
+import asyncio
 import html
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
@@ -18,6 +21,23 @@ ACCOUNT_AMOUNT_FORMATTER = (
     "Number(value || 0).toLocaleString(undefined, "
     "{ minimumFractionDigits: 2, maximumFractionDigits: 2 })"
 )
+LIVE_CACHE_SECONDS = 15.0
+HISTORY_CACHE_SECONDS = 60.0
+_response_cache: dict[str, tuple[float, dict]] = {}
+_response_cache_lock = asyncio.Lock()
+
+
+async def _cached_response(
+    key: str, ttl: float, load: Callable[[], Awaitable[dict]]
+) -> dict:
+    async with _response_cache_lock:
+        cached = _response_cache.get(key)
+        now = monotonic()
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        response = await load()
+        _response_cache[key] = (monotonic(), response)
+        return response
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -186,7 +206,7 @@ async def dashboard_home():
   document.getElementById("refresh").addEventListener("click", () => {{ loadLive(); loadHistory(); }});
   loadLive();
   loadHistory();
-  setInterval(loadLive, 5000);
+  setInterval(loadLive, 15000);
   setInterval(loadHistory, 60000);
 </script>
 </body>
@@ -196,6 +216,12 @@ async def dashboard_home():
 @router.get("/api/live")
 async def api_live_account():
     """Return current account state and open positions placed by this bot."""
+    return await _cached_response(
+        "live", LIVE_CACHE_SECONDS, _load_live_account
+    )
+
+
+async def _load_live_account() -> dict:
     try:
         account = await ctrader_client.get_account_info()
         positions = await ctrader_client.get_bot_positions()
@@ -246,6 +272,14 @@ async def api_live_account():
 @router.get("/api/history")
 async def api_trade_history(days: int = Query(default=30, ge=1, le=90)):
     """Return closed positions identified by the bot order label or its journal."""
+    return await _cached_response(
+        f"history:{days}",
+        HISTORY_CACHE_SECONDS,
+        lambda: _load_trade_history(days),
+    )
+
+
+async def _load_trade_history(days: int) -> dict:
     now = datetime.now(UTC)
     start = now - timedelta(days=days)
     try:

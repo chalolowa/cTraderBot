@@ -496,11 +496,6 @@ class TradingCycle:
             level=logging.INFO,
         )
 
-        await telegram.send_message_async(
-            f"{'BUY' if direction == 'long' else 'SELL'} {symbol} "
-            f"position_id={position_id} entry={actual_fill_price:.5f} SL={stop_loss:.5f} TP={take_profit:.5f}"
-        )
-
     # ------------------------------------------------------------------
     # Entry guards
     # ------------------------------------------------------------------
@@ -894,11 +889,24 @@ class TradingCycle:
             )
             return
 
+        entry_time = risk_manager._parse_ts(trade.get("entry_time"))
+        max_stall_minutes = float(cfg.get("stalled_trade_max_hold_minutes", 0))
+        if (
+            entry_time is not None
+            and max_stall_minutes > 0
+            and (datetime.now(UTC) - entry_time).total_seconds()
+            >= max_stall_minutes * 60
+            and peak_r < float(cfg.get("stalled_trade_min_progress_r", 0.5))
+        ):
+            await self._close_managed(
+                position_id, symbol, "time_stall", r_now, peak_r
+            )
+            return
+
         # 2. Reading the market again: reversal signs on candles that closed AFTER entry.
         analysis = await self._bar_analysis(symbol)
         analyzed = analysis["analyzed"] if analysis else None
         atr = analysis["atr"] if analysis else None
-        entry_time = risk_manager._parse_ts(trade.get("entry_time"))
         fresh_bar = bool(
             analysis
             and analysis["bar_close"]
@@ -1034,9 +1042,18 @@ class TradingCycle:
         elif broker_update_pending:
             try:
                 # amend replaces BOTH levels, so always send both.
-                await ctrader_client.amend_position_sltp(
-                    position_id, stop_loss=use_stop, take_profit=use_tp
-                )
+                if "tp_compress" in why:
+                    tp_pips = abs(use_tp - price) * pip_factor
+                    use_tp = await ctrader_client.modify_take_profit_pips(
+                        position_id, tp_pips, stop_loss=use_stop
+                    )
+                    risk_manager.update_trade_management(
+                        position_id, current_tp=use_tp
+                    )
+                else:
+                    await ctrader_client.amend_position_sltp(
+                        position_id, stop_loss=use_stop, take_profit=use_tp
+                    )
                 risk_manager.update_trade_management(
                     position_id, broker_stop=use_stop, broker_tp=use_tp
                 )
